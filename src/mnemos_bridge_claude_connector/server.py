@@ -1,9 +1,12 @@
 from __future__ import annotations
 
-import html
+import hashlib
 import hmac
+import html
 import logging
 import os
+import time
+from collections import OrderedDict
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -57,6 +60,43 @@ install_httpx_log_redaction()
 
 class MnemosValidationUnavailable(RuntimeError):
     pass
+
+
+_VALIDATION_CACHE_TTL_SECONDS = 30.0
+_VALIDATION_CACHE_MAX_ENTRIES = 512
+# sha256(api_key) -> expires_at_monotonic. Positive validations only;
+# 401/403 (invalid) and unavailable results are never cached so revocation is
+# honoured promptly. Only the validation outcome is cached — the MCP token is
+# always resolved fresh from configuration. Keyed by hash, never cleartext.
+_validation_cache: OrderedDict[str, float] = OrderedDict()
+
+
+def _validation_cache_key(api_key: str) -> str:
+    return hashlib.sha256(api_key.encode()).hexdigest()
+
+
+def _validation_cache_hit(api_key: str) -> bool:
+    digest = _validation_cache_key(api_key)
+    expires_at = _validation_cache.get(digest)
+    if expires_at is None:
+        return False
+    if time.monotonic() >= expires_at:
+        _validation_cache.pop(digest, None)
+        return False
+    _validation_cache.move_to_end(digest)
+    return True
+
+
+def _validation_cache_put(api_key: str) -> None:
+    digest = _validation_cache_key(api_key)
+    _validation_cache[digest] = time.monotonic() + _VALIDATION_CACHE_TTL_SECONDS
+    _validation_cache.move_to_end(digest)
+    while len(_validation_cache) > _VALIDATION_CACHE_MAX_ENTRIES:
+        _validation_cache.popitem(last=False)
+
+
+def _validation_cache_invalidate_for_test() -> None:
+    _validation_cache.clear()
 
 
 def _env_truthy(name: str) -> bool:
@@ -317,7 +357,9 @@ async def validate_mnemos_api_key(api_key: str) -> bool:
     return payload.get("authenticated") is True and bool(payload.get("user_id"))
 
 
-async def _validated_mcp_token(api_key: str) -> str | None:
+async def _validated_mcp_token(api_key: str, *, _uncached: bool = False) -> str | None:
+    if not _uncached and _validation_cache_hit(api_key):
+        return _mcp_token_for_api_key(api_key)
     try:
         valid = await validate_mnemos_api_key(api_key)
     except MnemosValidationUnavailable as exc:
@@ -325,18 +367,32 @@ async def _validated_mcp_token(api_key: str) -> str | None:
             "MNEMOS credential validation is temporarily unavailable"
         ) from exc
     if not valid:
+        _validation_cache.pop(_validation_cache_key(api_key), None)
         return None
+    if not _uncached:
+        _validation_cache_put(api_key)
     return _mcp_token_for_api_key(api_key)
 
 
 def _mcp_token_for_api_key(api_key: str) -> str | None:
+    if not isinstance(api_key, str) or not api_key:
+        return None
     raw_map = os.getenv("MNEMOS_MCP_TOKENS", "").strip()
     if raw_map:
         for item in raw_map.split(","):
             parts = [part.strip() for part in item.strip().split(":", 2)]
-            if len(parts) == 2 and parts[0] and parts[1] and api_key == parts[1]:
+            if (
+                len(parts) == 2
+                and parts[0]
+                and parts[1]
+                and hmac.compare_digest(api_key.encode(), parts[1].encode())
+            ):
                 return parts[1]
-            if len(parts) == 3 and all(parts) and api_key == parts[2]:
+            if (
+                len(parts) == 3
+                and all(parts)
+                and hmac.compare_digest(api_key.encode(), parts[2].encode())
+            ):
                 return parts[1]
         return None
 
@@ -494,7 +550,7 @@ async def oauth_token(request: Request) -> Response:
             )
 
         try:
-            mcp_token = await _validated_mcp_token(api_key)
+            mcp_token = await _validated_mcp_token(api_key, _uncached=True)
         except UpstreamCredentialUnavailable:
             return _oauth_error(
                 "temporarily_unavailable",
@@ -516,7 +572,7 @@ async def oauth_token(request: Request) -> Response:
         if api_key is None:
             return _oauth_error("invalid_grant", "Invalid refresh_token.")
         try:
-            mcp_token = await _validated_mcp_token(api_key)
+            mcp_token = await _validated_mcp_token(api_key, _uncached=True)
         except UpstreamCredentialUnavailable:
             return _oauth_error(
                 "temporarily_unavailable",
