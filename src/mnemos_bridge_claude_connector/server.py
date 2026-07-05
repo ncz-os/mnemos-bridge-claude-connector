@@ -26,12 +26,30 @@ except ModuleNotFoundError:
 
 
 MNEMOS_BACKEND_URL = os.getenv("MNEMOS_BACKEND_URL", "http://192.168.207.67:5003").rstrip("/")
-CONNECTOR_JWT_SECRET = os.getenv("CONNECTOR_JWT_SECRET")
-CONNECTOR_BIND = os.getenv("CONNECTOR_BIND", "0.0.0.0:8089")
+CONNECTOR_BIND = os.getenv("CONNECTOR_BIND", "127.0.0.1:8089")
 CONNECTOR_PUBLIC_URL = os.getenv("CONNECTOR_PUBLIC_URL", "http://localhost:8089").rstrip("/")
+_DEFAULT_ALLOWED_REDIRECT_URIS = ("https://claude.ai/api/mcp/auth_callback",)
+_MIN_JWT_SECRET_LENGTH = 32
+_TRUTHY = {"1", "true", "yes", "on"}
 
-if not CONNECTOR_JWT_SECRET:
-    raise RuntimeError("CONNECTOR_JWT_SECRET is required")
+
+def _env_truthy(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in _TRUTHY
+
+
+def _require_jwt_secret() -> str:
+    secret = os.getenv("CONNECTOR_JWT_SECRET", "")
+    if not secret:
+        raise RuntimeError("CONNECTOR_JWT_SECRET is required")
+    if len(secret) < _MIN_JWT_SECRET_LENGTH and not _env_truthy("CONNECTOR_ALLOW_WEAK_JWT_SECRET"):
+        raise RuntimeError(
+            "CONNECTOR_JWT_SECRET must be at least 32 characters; "
+            "set CONNECTOR_ALLOW_WEAK_JWT_SECRET=1 only for isolated tests"
+        )
+    return secret
+
+
+CONNECTOR_JWT_SECRET = _require_jwt_secret()
 
 
 RouteDecorator = Callable[[Callable[..., Any]], Callable[..., Any]]
@@ -161,6 +179,52 @@ def _redirect_uri_with_oauth_params(redirect_uri: str, code: str, state: str) ->
     )
 
 
+def _configured_allowed_redirect_uris() -> tuple[str, ...]:
+    raw = os.getenv("CONNECTOR_ALLOWED_REDIRECT_URIS", "")
+    values = tuple(part.strip() for part in raw.split(",") if part.strip())
+    return values or _DEFAULT_ALLOWED_REDIRECT_URIS
+
+
+def _normalise_redirect_uri(redirect_uri: str) -> str | None:
+    try:
+        parsed = urlsplit(redirect_uri)
+        port = parsed.port
+    except ValueError:
+        return None
+    if not parsed.scheme or not parsed.netloc or parsed.fragment:
+        return None
+    if parsed.username or parsed.password:
+        return None
+
+    scheme = parsed.scheme.lower()
+    hostname = (parsed.hostname or "").lower()
+    if not hostname:
+        return None
+    if scheme != "https" and not (scheme == "http" and hostname in {"localhost", "127.0.0.1", "::1"}):
+        return None
+
+    if ":" in hostname and not hostname.startswith("["):
+        netloc = f"[{hostname}]"
+    else:
+        netloc = hostname
+    if port is not None:
+        netloc = f"{netloc}:{port}"
+
+    return urlunsplit((scheme, netloc, parsed.path or "", parsed.query, ""))
+
+
+def _redirect_uri_allowed(redirect_uri: str) -> bool:
+    normalised = _normalise_redirect_uri(redirect_uri)
+    if normalised is None:
+        return False
+    allowed = {
+        value
+        for uri in _configured_allowed_redirect_uris()
+        if (value := _normalise_redirect_uri(uri)) is not None
+    }
+    return normalised in allowed
+
+
 def _oauth_error(error: str, description: str, status_code: int = 400) -> Response:
     try:
         from fastapi.responses import JSONResponse
@@ -203,13 +267,19 @@ async def validate_mnemos_api_key(api_key: str) -> bool:
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             response = await client.get(
-                f"{MNEMOS_BACKEND_URL}/health",
+                f"{MNEMOS_BACKEND_URL}/auth/oauth/me",
                 headers={"Authorization": f"Bearer {api_key}"},
             )
     except httpx.HTTPError:
         return False
 
-    return response.status_code == 200
+    if response.status_code != 200:
+        return False
+    try:
+        payload = response.json()
+    except ValueError:
+        return False
+    return payload.get("authenticated") is True and bool(payload.get("user_id"))
 
 
 @app.get("/.well-known/oauth-authorization-server")
@@ -251,6 +321,13 @@ async def oauth_authorize_post(request: Request) -> Response:
         return _render_authorize_form(
             params,
             error="Missing redirect_uri. Please try again.",
+            status_code=400,
+        )
+
+    if not _redirect_uri_allowed(params["redirect_uri"]):
+        return _render_authorize_form(
+            params,
+            error="Unsupported redirect_uri. Please ask the connector operator to allow it.",
             status_code=400,
         )
 

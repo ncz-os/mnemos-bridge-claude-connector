@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import os
 import secrets
 import time
 from dataclasses import dataclass
@@ -17,11 +18,18 @@ class CodeEntry:
     expires_at: float
 
 
+@dataclass(slots=True)
+class RefreshEntry:
+    api_key: str
+    expires_at: float
+
+
 _code_store: dict[str, CodeEntry] = {}
-_refresh_store: dict[str, str] = {}
+_refresh_store: dict[str, RefreshEntry] = {}
 
 _AUTHORIZATION_CODE_TTL_SECONDS = 60
 _ACCESS_TOKEN_TTL_SECONDS = 3600
+_DEFAULT_REFRESH_TOKEN_TTL_SECONDS = 30 * 24 * 60 * 60
 _SUPPORTED_CODE_CHALLENGE_METHOD = "S256"
 
 
@@ -34,6 +42,32 @@ def _jwt_module():
 def _base64url_sha256(value: str) -> str:
     digest = hashlib.sha256(value.encode()).digest()
     return base64.urlsafe_b64encode(digest).decode().rstrip("=")
+
+
+def _positive_int(raw: str | None) -> int | None:
+    try:
+        value = int(raw or "")
+    except ValueError:
+        return None
+    return value if value > 0 else None
+
+
+def _refresh_token_ttl_seconds() -> int:
+    return (
+        _positive_int(os.getenv("CONNECTOR_REFRESH_TOKEN_TTL_SECONDS"))
+        or _DEFAULT_REFRESH_TOKEN_TTL_SECONDS
+    )
+
+
+def _prune_expired_refresh_tokens(now: float | None = None) -> None:
+    current_time = time.time() if now is None else now
+    expired = [
+        token
+        for token, entry in _refresh_store.items()
+        if entry.expires_at < current_time
+    ]
+    for token in expired:
+        _refresh_store.pop(token, None)
 
 
 def generate_code(
@@ -77,6 +111,7 @@ def consume_code(code: str, code_verifier: str) -> str | None:
 def issue_access_token(api_key: str, jwt_secret: str) -> tuple[str, str]:
     jwt = _jwt_module()
     now = int(time.time())
+    _prune_expired_refresh_tokens(now)
     access_token = jwt.encode(
         {
             "sub": api_key,
@@ -88,7 +123,10 @@ def issue_access_token(api_key: str, jwt_secret: str) -> tuple[str, str]:
         algorithm="HS256",
     )
     refresh_token = secrets.token_urlsafe(32)
-    _refresh_store[refresh_token] = api_key
+    _refresh_store[refresh_token] = RefreshEntry(
+        api_key=api_key,
+        expires_at=now + _refresh_token_ttl_seconds(),
+    )
     return access_token, refresh_token
 
 
@@ -110,15 +148,19 @@ def verify_access_token(token: str, jwt_secret: str) -> str | None:
 
 
 def exchange_refresh_token(refresh_token: str, jwt_secret: str) -> tuple[str, str] | None:
-    api_key = _refresh_store.pop(refresh_token, None)
-    if api_key is None:
+    entry = _refresh_store.pop(refresh_token, None)
+    if entry is None:
         return None
 
-    return issue_access_token(api_key, jwt_secret)
+    if entry.expires_at < time.time():
+        return None
+
+    return issue_access_token(entry.api_key, jwt_secret)
 
 
 __all__ = [
     "CodeEntry",
+    "RefreshEntry",
     "_code_store",
     "_refresh_store",
     "consume_code",

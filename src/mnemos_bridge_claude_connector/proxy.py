@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from collections.abc import AsyncIterator
 from typing import TYPE_CHECKING, Any
 
@@ -30,6 +31,48 @@ def _json_response(payload: dict[str, str], status_code: int) -> Response:
         raise RuntimeError("fastapi is required to build proxy responses") from exc
 
     return JSONResponse(payload, status_code=status_code)
+
+
+_DEFAULT_MAX_BODY_BYTES = 5 * 1024 * 1024
+_HOP_BY_HOP_HEADERS = {
+    "authorization",
+    "connection",
+    "content-length",
+    "host",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+}
+
+
+class _PayloadTooLarge(Exception):
+    pass
+
+
+def _positive_int(raw: str | None) -> int | None:
+    try:
+        value = int(raw or "")
+    except ValueError:
+        return None
+    return value if value > 0 else None
+
+
+def _max_body_bytes() -> int:
+    return _positive_int(os.getenv("CONNECTOR_MAX_BODY_BYTES")) or _DEFAULT_MAX_BODY_BYTES
+
+
+async def _read_body_limited(request: Request) -> bytes:
+    max_bytes = _max_body_bytes()
+    body = bytearray()
+    async for chunk in request.stream():
+        if len(body) + len(chunk) > max_bytes:
+            raise _PayloadTooLarge
+        body.extend(chunk)
+    return bytes(body)
 
 
 def _streaming_response(body: AsyncIterator[bytes], status_code: int) -> Response:
@@ -67,7 +110,7 @@ def _headers_with_swapped_authorization(request: Request, api_key: str) -> dict[
     headers = {
         name: value
         for name, value in request.headers.items()
-        if name.lower() != "authorization"
+        if name.lower() not in _HOP_BY_HOP_HEADERS
     }
     headers["Authorization"] = f"Bearer {api_key}"
     return headers
@@ -120,7 +163,14 @@ async def messages_proxy(request: Request, backend_url: str, jwt_secret: str) ->
     if api_key is None:
         return _unauthorized_response()
 
-    body = await request.body()
+    try:
+        body = await _read_body_limited(request)
+    except _PayloadTooLarge:
+        return _json_response(
+            {"error": "payload_too_large", "detail": "proxied MCP message body exceeds limit"},
+            status_code=413,
+        )
+
     httpx = _httpx_module()
     try:
         async with httpx.AsyncClient(timeout=None) as client:

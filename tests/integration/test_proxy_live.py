@@ -13,7 +13,7 @@ pytestmark = pytest.mark.skipif(
     reason="MNEMOS_TEST_BASE is not set",
 )
 
-os.environ.setdefault("CONNECTOR_JWT_SECRET", "integration-test-secret")
+os.environ["CONNECTOR_JWT_SECRET"] = "integration-test-secret-with-enough-entropy"
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
 from mnemos_bridge_claude_connector import oauth  # noqa: E402

@@ -12,7 +12,7 @@ import httpx
 import pytest
 
 
-os.environ.setdefault("CONNECTOR_JWT_SECRET", "offline-test-secret")
+os.environ["CONNECTOR_JWT_SECRET"] = "offline-test-secret-with-enough-entropy"
 os.environ.setdefault("CONNECTOR_PUBLIC_URL", "http://connector.test")
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -100,6 +100,45 @@ async def test_authorize_post_valid_key_redirects_with_code_and_state(
     query = parse_qs(urlsplit(location).query)
     assert query["code"][0]
     assert query["state"][0] == authorize_params["state"]
+
+
+async def test_authorize_post_rejects_unallowed_redirect_uri(
+    client: httpx.AsyncClient,
+    authorize_params: dict[str, str],
+) -> None:
+    response = await client.post(
+        "/oauth/authorize",
+        data={
+            **authorize_params,
+            "redirect_uri": "https://attacker.example/callback",
+            "mnemos_api_key": "valid-test-key",
+        },
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 400
+    assert "Unsupported redirect_uri" in response.text
+    assert oauth._code_store == {}
+
+
+async def test_authorize_post_allows_configured_loopback_redirect(
+    client: httpx.AsyncClient,
+    authorize_params: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CONNECTOR_ALLOWED_REDIRECT_URIS", "http://localhost:8765/callback")
+
+    response = await client.post(
+        "/oauth/authorize",
+        data={
+            **authorize_params,
+            "redirect_uri": "http://localhost:8765/callback",
+            "mnemos_api_key": "valid-test-key",
+        },
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 302
 
 
 async def test_authorize_post_invalid_key_returns_html_error(
@@ -216,3 +255,40 @@ async def test_sse_with_invalid_jwt_returns_401(client: httpx.AsyncClient) -> No
 
     assert response.status_code == 401
     assert response.json()["error"] == "unauthorized"
+
+
+async def test_validate_mnemos_api_key_requires_authenticated_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requests: list[tuple[str, dict[str, str]]] = []
+
+    class _Response:
+        status_code = 200
+
+        def json(self) -> dict[str, object]:
+            return {"authenticated": False, "user_id": "default"}
+
+    class _Client:
+        def __init__(self, *, timeout: float):
+            self.timeout = timeout
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args: object) -> None:
+            return None
+
+        async def get(self, url: str, headers: dict[str, str]):
+            requests.append((url, headers))
+            return _Response()
+
+    monkeypatch.setattr(httpx, "AsyncClient", _Client)
+    monkeypatch.setattr(server_module, "MNEMOS_BACKEND_URL", "http://mnemos.test")
+
+    assert await server_module.validate_mnemos_api_key("candidate-key") is False
+    assert requests == [
+        (
+            "http://mnemos.test/auth/oauth/me",
+            {"Authorization": "Bearer candidate-key"},
+        )
+    ]

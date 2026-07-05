@@ -15,7 +15,7 @@ claim from that JWT as the upstream bearer token for MCP proxy requests.
 
 - A running MNEMOS MCP server. The default backend URL targets PYTHIA on port
   `5003`.
-- A strong `CONNECTOR_JWT_SECRET` value.
+- A strong `CONNECTOR_JWT_SECRET` value with at least 32 characters.
 - TLS termination for production OAuth traffic. Terminate HTTPS in front of this
   service with nginx or an equivalent reverse proxy.
 
@@ -31,14 +31,18 @@ pip install mnemos-bridge-claude-connector
 | --- | --- | --- | --- |
 | `MNEMOS_BACKEND_URL` | No | `http://192.168.207.67:5003` | Base URL for the MNEMOS MCP server. |
 | `CONNECTOR_JWT_SECRET` | Yes | None | HS256 signing secret for connector access tokens. |
-| `CONNECTOR_BIND` | No | `0.0.0.0:8089` | Host and port used by `mnemos-claude-connector`. |
+| `CONNECTOR_BIND` | No | `127.0.0.1:8089` | Host and port used by `mnemos-claude-connector`. Bind an explicit non-loopback address only behind TLS/reverse-proxy controls. |
 | `CONNECTOR_PUBLIC_URL` | No | `http://localhost:8089` | Public issuer and endpoint base URL advertised to Claude.ai. |
+| `CONNECTOR_ALLOWED_REDIRECT_URIS` | No | `https://claude.ai/api/mcp/auth_callback` | Comma-separated exact OAuth redirect URI allowlist. Loopback HTTP is allowed for local testing; production redirects should be HTTPS. |
+| `CONNECTOR_MAX_BODY_BYTES` | No | `5242880` | Maximum proxied `/messages/` request body size. |
+| `CONNECTOR_REFRESH_TOKEN_TTL_SECONDS` | No | `2592000` | Refresh-token lifetime. |
 
 ## Running
 
 ```bash
 export CONNECTOR_JWT_SECRET='replace-with-a-long-random-secret'
 export CONNECTOR_PUBLIC_URL='https://mnemos-connector.example.com'
+export CONNECTOR_ALLOWED_REDIRECT_URIS='https://claude.ai/api/mcp/auth_callback'
 mnemos-claude-connector
 ```
 
@@ -62,10 +66,12 @@ that are scoped to the MNEMOS API key they supplied.
   backend.
 - Keep `CONNECTOR_JWT_SECRET` private and rotate it according to your operator
   policy. Rotating the secret invalidates existing access tokens.
+- Keep `CONNECTOR_ALLOWED_REDIRECT_URIS` narrow. Authorization codes are issued
+  only to exact allowlisted redirect URIs so a malicious OAuth client cannot
+  receive a code for a user-entered MNEMOS API key.
 - Run behind HTTPS in production. OAuth redirects and bearer tokens must not
   traverse public networks over plain HTTP.
 
 ## Known Limitations
 
-- Refresh tokens do not expire in v0.1.
 - The in-memory token store is lost when the process restarts.
