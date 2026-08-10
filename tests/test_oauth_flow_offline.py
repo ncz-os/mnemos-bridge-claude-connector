@@ -29,6 +29,7 @@ def _pkce_challenge(verifier: str) -> str:
 @pytest.fixture(autouse=True)
 def _clear_oauth_stores() -> None:
     oauth._code_store.clear()
+    oauth._access_store.clear()
     oauth._refresh_store.clear()
 
 
@@ -166,6 +167,8 @@ async def test_token_valid_code_and_pkce_verifier_returns_access_token(
             "grant_type": "authorization_code",
             "code": code,
             "code_verifier": "correct-verifier",
+            "client_id": authorize_params["client_id"],
+            "redirect_uri": authorize_params["redirect_uri"],
         },
     )
 
@@ -189,6 +192,8 @@ async def test_token_invalid_pkce_verifier_returns_oauth_error(
             "grant_type": "authorization_code",
             "code": code,
             "code_verifier": "wrong-verifier",
+            "client_id": authorize_params["client_id"],
+            "redirect_uri": authorize_params["redirect_uri"],
         },
     )
 
@@ -209,6 +214,8 @@ async def test_token_expired_code_returns_oauth_error(
             "grant_type": "authorization_code",
             "code": code,
             "code_verifier": "correct-verifier",
+            "client_id": authorize_params["client_id"],
+            "redirect_uri": authorize_params["redirect_uri"],
         },
     )
 
@@ -227,6 +234,8 @@ async def test_refresh_token_grant_returns_new_access_token(
             "grant_type": "authorization_code",
             "code": code,
             "code_verifier": "correct-verifier",
+            "client_id": authorize_params["client_id"],
+            "redirect_uri": authorize_params["redirect_uri"],
         },
     )
     refresh_token = token_response.json()["refresh_token"]
@@ -241,6 +250,36 @@ async def test_refresh_token_grant_returns_new_access_token(
     assert payload["access_token"]
     assert payload["refresh_token"]
     assert payload["refresh_token"] != refresh_token
+
+
+@pytest.mark.parametrize(
+    ("field", "mismatched_value"),
+    [
+        ("client_id", "different-client"),
+        ("redirect_uri", "https://wrong.example/callback"),
+    ],
+)
+async def test_token_rejects_code_binding_mismatch_without_consuming_code(
+    client: httpx.AsyncClient,
+    authorize_params: dict[str, str],
+    field: str,
+    mismatched_value: str,
+) -> None:
+    code = await _authorize_for_code(client, authorize_params)
+    token_params = {
+        "grant_type": "authorization_code",
+        "code": code,
+        "code_verifier": "correct-verifier",
+        "client_id": authorize_params["client_id"],
+        "redirect_uri": authorize_params["redirect_uri"],
+        field: mismatched_value,
+    }
+
+    response = await client.post("/oauth/token", data=token_params)
+
+    assert response.status_code == 400
+    assert response.json()["error"] == "invalid_grant"
+    assert code in oauth._code_store
 
 
 async def test_sse_without_bearer_returns_401(client: httpx.AsyncClient) -> None:

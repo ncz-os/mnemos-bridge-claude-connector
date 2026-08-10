@@ -178,6 +178,7 @@ async def messages_proxy(request: Request, backend_url: str, jwt_secret: str) ->
                 f"{backend_url.rstrip('/')}/messages/",
                 content=body,
                 headers=_headers_with_swapped_authorization(request, api_key),
+                params=request.query_params.multi_items(),
             )
     except httpx.HTTPError as exc:
         return _json_response({"error": "bad_gateway", "detail": str(exc)}, status_code=502)

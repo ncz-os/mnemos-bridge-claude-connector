@@ -20,6 +20,7 @@ JWT_SECRET_B = "secret-b-with-enough-entropy-for-hs256"
 
 def setup_function() -> None:
     oauth._code_store.clear()
+    oauth._access_store.clear()
     oauth._refresh_store.clear()
 
 
@@ -27,6 +28,15 @@ def test_access_token_round_trip() -> None:
     token, _refresh_token = oauth.issue_access_token("test-api-key", JWT_SECRET_A)
 
     assert oauth.verify_access_token(token, JWT_SECRET_A) == "test-api-key"
+
+
+def test_access_token_does_not_disclose_api_key_in_claims() -> None:
+    token, _refresh_token = oauth.issue_access_token("test-api-key", JWT_SECRET_A)
+
+    claims = jwt.decode(token, JWT_SECRET_A, algorithms=["HS256"])
+
+    assert "test-api-key" not in claims.values()
+    assert claims["sub"] in oauth._access_store
 
 
 def test_access_token_wrong_secret_rejected() -> None:

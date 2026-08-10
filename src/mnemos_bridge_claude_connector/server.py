@@ -343,6 +343,7 @@ async def oauth_authorize_post(request: Request) -> Response:
 
     code = generate_code(
         api_key,
+        params["client_id"],
         params["code_challenge"],
         params["code_challenge_method"],
         params["redirect_uri"],
@@ -364,10 +365,15 @@ async def oauth_token(request: Request) -> Response:
     if grant_type == "authorization_code":
         code = str(form.get("code", ""))
         code_verifier = str(form.get("code_verifier", ""))
-        if not code or not code_verifier:
-            return _oauth_error("invalid_request", "Missing code or code_verifier.")
+        redirect_uri = str(form.get("redirect_uri", ""))
+        client_id = str(form.get("client_id", ""))
+        if not code or not code_verifier or not redirect_uri or not client_id:
+            return _oauth_error(
+                "invalid_request",
+                "Missing code, code_verifier, redirect_uri, or client_id.",
+            )
 
-        api_key = consume_code(code, code_verifier)
+        api_key = consume_code(code, code_verifier, redirect_uri, client_id)
         if api_key is None:
             return _oauth_error(
                 "invalid_grant",

@@ -35,6 +35,17 @@ class _StreamRequest:
             yield chunk
 
 
+class _MessagesRequest(_StreamRequest):
+    headers = {"authorization": "Bearer connector-token"}
+
+    class _QueryParams:
+        @staticmethod
+        def multi_items() -> list[tuple[str, str]]:
+            return [("session_id", "abc"), ("tag", "one"), ("tag", "two")]
+
+    query_params = _QueryParams()
+
+
 def test_headers_with_swapped_authorization_drops_hop_by_hop_headers() -> None:
     headers = proxy._headers_with_swapped_authorization(_HeaderRequest(), "mnemos-key")
 
@@ -58,3 +69,51 @@ async def test_read_body_limited_allows_exact_limit(monkeypatch: pytest.MonkeyPa
     monkeypatch.setenv("CONNECTOR_MAX_BODY_BYTES", "4")
 
     assert await proxy._read_body_limited(_StreamRequest([b"ab", b"cd"])) == b"abcd"
+
+
+@pytest.mark.asyncio
+async def test_messages_proxy_forwards_all_query_parameters(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    posted: dict[str, object] = {}
+
+    class _Upstream:
+        content = b"accepted"
+        status_code = 202
+        headers: dict[str, str] = {}
+
+    class _Client:
+        def __init__(self, *, timeout: None):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args: object) -> None:
+            return None
+
+        async def post(self, url: str, **kwargs: object) -> _Upstream:
+            posted["url"] = url
+            posted.update(kwargs)
+            return _Upstream()
+
+    class _Httpx:
+        AsyncClient = _Client
+        HTTPError = Exception
+
+    monkeypatch.setattr(proxy, "verify_access_token", lambda *_args: "mnemos-key")
+    monkeypatch.setattr(proxy, "_httpx_module", lambda: _Httpx)
+
+    response = await proxy.messages_proxy(
+        _MessagesRequest([b"message"]),
+        "http://mnemos.test",
+        "jwt-secret",
+    )
+
+    assert response.status_code == 202
+    assert posted["url"] == "http://mnemos.test/messages/"
+    assert posted["params"] == [
+        ("session_id", "abc"),
+        ("tag", "one"),
+        ("tag", "two"),
+    ]
