@@ -230,7 +230,7 @@ async def test_token_valid_code_and_pkce_verifier_returns_access_token(
     assert payload["refresh_token"]
     assert (
         oauth.verify_access_token(payload["access_token"], server_module.CONNECTOR_JWT_SECRET)
-        == "configured-mcp-token"
+        == "valid-test-key"
     )
 
 
@@ -304,6 +304,37 @@ async def test_refresh_token_grant_returns_new_access_token(
     assert payload["access_token"]
     assert payload["refresh_token"]
     assert payload["refresh_token"] != refresh_token
+
+
+async def test_refresh_token_rejects_key_revoked_after_authorization(
+    client: httpx.AsyncClient,
+    authorize_params: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    code = await _authorize_for_code(client, authorize_params)
+    token_response = await client.post(
+        "/oauth/token",
+        data={
+            "grant_type": "authorization_code",
+            "code": code,
+            "code_verifier": "correct-verifier",
+            "client_id": authorize_params["client_id"],
+            "redirect_uri": authorize_params["redirect_uri"],
+        },
+    )
+    refresh_token = token_response.json()["refresh_token"]
+
+    async def revoked(_api_key: str) -> bool:
+        return False
+
+    monkeypatch.setattr(server_module, "validate_mnemos_api_key", revoked)
+    response = await client.post(
+        "/oauth/token",
+        data={"grant_type": "refresh_token", "refresh_token": refresh_token},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"] == "invalid_grant"
 
 
 @pytest.mark.parametrize(
@@ -467,6 +498,53 @@ async def test_validate_mnemos_api_key_raises_on_connection_failure(
         await server_module.validate_mnemos_api_key("valid-test-key")
 
 
+@pytest.mark.parametrize(
+    ("settings", "api_key", "expected_mcp_token"),
+    [
+        ({"MNEMOS_MCP_TOKENS": "user:api-key"}, "api-key", "api-key"),
+        (
+            {"MNEMOS_MCP_TOKENS": "user:mcp-token:api-key"},
+            "api-key",
+            "mcp-token",
+        ),
+        (
+            {
+                "MNEMOS_MCP_TOKEN": "shared-token",
+                "CONNECTOR_SINGLE_USER_API_KEY": "api-key",
+            },
+            "api-key",
+            "shared-token",
+        ),
+        (
+            {"MNEMOS_MCP_TOKENS": "user:mcp-token:api-key"},
+            "mcp-token",
+            None,
+        ),
+    ],
+)
+async def test_live_validation_resolves_all_supported_mcp_token_forms_and_rejects_old_static_tokens(
+    monkeypatch: pytest.MonkeyPatch,
+    settings: dict[str, str],
+    api_key: str,
+    expected_mcp_token: str | None,
+) -> None:
+    for name in (
+        "MNEMOS_MCP_TOKENS",
+        "MNEMOS_MCP_TOKEN",
+        "CONNECTOR_SINGLE_USER_API_KEY",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    for name, value in settings.items():
+        monkeypatch.setenv(name, value)
+
+    async def live_validation(candidate: str) -> bool:
+        return candidate == "api-key"
+
+    monkeypatch.setattr(server_module, "validate_mnemos_api_key", live_validation)
+
+    assert await server_module._validated_mcp_token(api_key) == expected_mcp_token
+
+
 async def test_authorize_uses_provisioned_per_user_mcp_token(
     client: httpx.AsyncClient,
     authorize_params: dict[str, str],
@@ -487,7 +565,7 @@ async def test_authorize_uses_provisioned_per_user_mcp_token(
             authorize_params["redirect_uri"],
             authorize_params["client_id"],
         )
-        == "user-mcp-token"
+        == "valid-test-key"
     )
 
 
@@ -530,7 +608,7 @@ async def test_shared_token_accepts_only_configured_single_user_key(
             authorize_params["redirect_uri"],
             authorize_params["client_id"],
         )
-        == "shared-mcp-token"
+        == "valid-test-key"
     )
 
 
@@ -575,7 +653,7 @@ async def test_per_user_mapping_takes_precedence_over_shared_token(
             authorize_params["redirect_uri"],
             authorize_params["client_id"],
         )
-        == "user-mcp-token"
+        == "valid-test-key"
     )
 
 
@@ -603,11 +681,15 @@ async def test_routes_proxy_to_mcp_url(
 ) -> None:
     captured: list[str] = []
 
-    async def fake_sse_proxy(_request: object, backend_url: str, _secret: str):
+    async def fake_sse_proxy(
+        _request: object, backend_url: str, _secret: str, _resolver: object
+    ):
         captured.append(backend_url)
         return server_module._oauth_error("test", "test", status_code=418)
 
-    async def fake_messages_proxy(_request: object, backend_url: str, _secret: str):
+    async def fake_messages_proxy(
+        _request: object, backend_url: str, _secret: str, _resolver: object
+    ):
         captured.append(backend_url)
         return server_module._oauth_error("test", "test", status_code=418)
 
@@ -618,3 +700,77 @@ async def test_routes_proxy_to_mcp_url(
     assert (await client.get("/sse")).status_code == 418
     assert (await client.post("/messages/")).status_code == 418
     assert captured == ["http://mnemos-mcp.test", "http://mnemos-mcp.test"]
+
+
+def test_generate_code_prunes_expired_codes_before_insert(
+    authorize_params: dict[str, str],
+) -> None:
+    expired = oauth.generate_code(
+        "valid-test-key",
+        authorize_params["client_id"],
+        authorize_params["code_challenge"],
+        "S256",
+        authorize_params["redirect_uri"],
+    )
+    oauth._set_expiry_for_test("code", expired, time.time() - 1)
+
+    oauth.generate_code(
+        "valid-test-key",
+        authorize_params["client_id"],
+        authorize_params["code_challenge"],
+        "S256",
+        authorize_params["redirect_uri"],
+    )
+
+    assert not oauth._entry_exists_for_test("code", expired)
+    assert oauth._entry_count_for_test("code") == 1
+
+
+def test_generate_code_caps_outstanding_codes_per_principal_and_client(
+    authorize_params: dict[str, str],
+) -> None:
+    for _ in range(oauth._MAX_OUTSTANDING_CODES_PER_PRINCIPAL_CLIENT):
+        oauth.generate_code(
+            "valid-test-key",
+            authorize_params["client_id"],
+            authorize_params["code_challenge"],
+            "S256",
+            authorize_params["redirect_uri"],
+        )
+
+    with pytest.raises(oauth.AuthorizationCodeLimitExceeded):
+        oauth.generate_code(
+            "valid-test-key",
+            authorize_params["client_id"],
+            authorize_params["code_challenge"],
+            "S256",
+            authorize_params["redirect_uri"],
+        )
+
+
+def test_generate_code_rate_limits_redeemed_codes(
+    authorize_params: dict[str, str],
+) -> None:
+    for _ in range(oauth._MAX_CODE_ISSUANCES_PER_PRINCIPAL_CLIENT):
+        code = oauth.generate_code(
+            "valid-test-key",
+            authorize_params["client_id"],
+            authorize_params["code_challenge"],
+            "S256",
+            authorize_params["redirect_uri"],
+        )
+        assert oauth.consume_code(
+            code,
+            "correct-verifier",
+            authorize_params["redirect_uri"],
+            authorize_params["client_id"],
+        ) == "valid-test-key"
+
+    with pytest.raises(oauth.AuthorizationCodeLimitExceeded):
+        oauth.generate_code(
+            "valid-test-key",
+            authorize_params["client_id"],
+            authorize_params["code_challenge"],
+            "S256",
+            authorize_params["redirect_uri"],
+        )

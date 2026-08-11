@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 import os
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import TYPE_CHECKING, Any
 
 from .oauth import verify_access_token
@@ -53,6 +53,13 @@ _HOP_BY_HOP_HEADERS = {
 
 class _PayloadTooLarge(Exception):
     pass
+
+
+class UpstreamCredentialUnavailable(RuntimeError):
+    pass
+
+
+CredentialResolver = Callable[[str], Awaitable[str | None]]
 
 
 def _positive_int(raw: str | None) -> int | None:
@@ -130,12 +137,34 @@ def _unauthorized_response() -> Response:
     return _json_response({"error": "unauthorized"}, status_code=401)
 
 
-async def sse_proxy(request: Request, backend_url: str, jwt_secret: str) -> Response:
+async def _resolve_upstream_token(
+    principal: str,
+    resolver: CredentialResolver | None,
+) -> str | None:
+    if resolver is None:
+        return principal
+    return await resolver(principal)
+
+
+async def sse_proxy(
+    request: Request,
+    backend_url: str,
+    jwt_secret: str,
+    credential_resolver: CredentialResolver | None = None,
+) -> Response:
     token = extract_bearer(request)
     if token is None:
         return _unauthorized_response()
 
-    api_key = verify_access_token(token, jwt_secret)
+    principal = verify_access_token(token, jwt_secret)
+    if principal is None:
+        return _unauthorized_response()
+    try:
+        api_key = await _resolve_upstream_token(principal, credential_resolver)
+    except UpstreamCredentialUnavailable as exc:
+        return _json_response(
+            {"error": "service_unavailable", "detail": str(exc)}, status_code=503
+        )
     if api_key is None:
         return _unauthorized_response()
 
@@ -164,12 +193,25 @@ async def sse_proxy(request: Request, backend_url: str, jwt_secret: str) -> Resp
     return _streaming_response(body_iterator(), status_code=upstream.status_code)
 
 
-async def messages_proxy(request: Request, backend_url: str, jwt_secret: str) -> Response:
+async def messages_proxy(
+    request: Request,
+    backend_url: str,
+    jwt_secret: str,
+    credential_resolver: CredentialResolver | None = None,
+) -> Response:
     token = extract_bearer(request)
     if token is None:
         return _unauthorized_response()
 
-    api_key = verify_access_token(token, jwt_secret)
+    principal = verify_access_token(token, jwt_secret)
+    if principal is None:
+        return _unauthorized_response()
+    try:
+        api_key = await _resolve_upstream_token(principal, credential_resolver)
+    except UpstreamCredentialUnavailable as exc:
+        return _json_response(
+            {"error": "service_unavailable", "detail": str(exc)}, status_code=503
+        )
     if api_key is None:
         return _unauthorized_response()
 
@@ -202,4 +244,4 @@ async def messages_proxy(request: Request, backend_url: str, jwt_secret: str) ->
     return _response(content=upstream.content, status_code=upstream.status_code, headers=headers)
 
 
-__all__ = ["extract_bearer", "messages_proxy", "sse_proxy"]
+__all__ = ["UpstreamCredentialUnavailable", "extract_bearer", "messages_proxy", "sse_proxy"]

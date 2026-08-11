@@ -37,6 +37,13 @@ _AUTHORIZATION_CODE_TTL_SECONDS = 60
 _ACCESS_TOKEN_TTL_SECONDS = 3600
 _DEFAULT_REFRESH_TOKEN_TTL_SECONDS = 30 * 24 * 60 * 60
 _SUPPORTED_CODE_CHALLENGE_METHOD = "S256"
+_MAX_OUTSTANDING_CODES_PER_PRINCIPAL_CLIENT = 5
+_MAX_CODE_ISSUANCES_PER_PRINCIPAL_CLIENT = 10
+_CODE_ISSUANCE_WINDOW_SECONDS = 60
+
+
+class AuthorizationCodeLimitExceeded(RuntimeError):
+    pass
 
 
 def _jwt_module():
@@ -184,16 +191,61 @@ def generate_code(
         raise ValueError("only S256 PKCE code challenge method is supported")
 
     code = secrets.token_urlsafe(32)
-    _save_entry(
-        "code",
-        code,
-        api_key,
-        time.time() + _AUTHORIZATION_CODE_TTL_SECONDS,
-        client_id=client_id,
-        code_challenge=code_challenge,
-        code_challenge_method=code_challenge_method,
-        redirect_uri=redirect_uri,
-    )
+    now = time.time()
+    with _connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        connection.execute(
+            "DELETE FROM connector_oauth_entries "
+            "WHERE kind IN ('code', 'code_issue') AND expires_at <= ?",
+            (now,),
+        )
+        outstanding = connection.execute(
+            "SELECT COUNT(*) FROM connector_oauth_entries "
+            "WHERE kind = 'code' AND api_key = ? AND client_id = ?",
+            (api_key, client_id),
+        ).fetchone()[0]
+        recent_issuances = connection.execute(
+            "SELECT COUNT(*) FROM connector_oauth_entries "
+            "WHERE kind = 'code_issue' AND api_key = ? AND client_id = ?",
+            (api_key, client_id),
+        ).fetchone()[0]
+        if (
+            outstanding >= _MAX_OUTSTANDING_CODES_PER_PRINCIPAL_CLIENT
+            or recent_issuances >= _MAX_CODE_ISSUANCES_PER_PRINCIPAL_CLIENT
+        ):
+            raise AuthorizationCodeLimitExceeded(
+                "authorization code issuance limit exceeded"
+            )
+        connection.execute(
+            """
+            INSERT INTO connector_oauth_entries (
+                kind, token, api_key, client_id, code_challenge,
+                code_challenge_method, redirect_uri, expires_at
+            ) VALUES ('code', ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                code,
+                api_key,
+                client_id,
+                code_challenge,
+                code_challenge_method,
+                redirect_uri,
+                now + _AUTHORIZATION_CODE_TTL_SECONDS,
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO connector_oauth_entries (
+                kind, token, api_key, client_id, expires_at
+            ) VALUES ('code_issue', ?, ?, ?, ?)
+            """,
+            (
+                secrets.token_urlsafe(32),
+                api_key,
+                client_id,
+                now + _CODE_ISSUANCE_WINDOW_SECONDS,
+            ),
+        )
     return code
 
 
@@ -335,13 +387,29 @@ def exchange_refresh_token(refresh_token: str, jwt_secret: str) -> tuple[str, st
     return issue_access_token(entry.api_key, jwt_secret)
 
 
+def peek_refresh_token(refresh_token: str) -> str | None:
+    """Return the bound principal without consuming a valid refresh token."""
+    with _connect() as connection:
+        row = connection.execute(
+            "SELECT api_key, expires_at FROM connector_oauth_entries "
+            "WHERE kind = 'refresh' AND token = ?",
+            (refresh_token,),
+        ).fetchone()
+    if row is None:
+        return None
+    entry = RefreshEntry(*row)
+    return entry.api_key if entry.expires_at >= time.time() else None
+
+
 __all__ = [
     "AccessEntry",
+    "AuthorizationCodeLimitExceeded",
     "CodeEntry",
     "RefreshEntry",
     "consume_code",
     "exchange_refresh_token",
     "generate_code",
     "issue_access_token",
+    "peek_refresh_token",
     "verify_access_token",
 ]

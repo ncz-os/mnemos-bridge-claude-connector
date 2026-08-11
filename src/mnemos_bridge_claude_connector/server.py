@@ -9,12 +9,14 @@ from typing import TYPE_CHECKING, Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from .oauth import (
+    AuthorizationCodeLimitExceeded,
     consume_code,
     exchange_refresh_token,
     generate_code,
     issue_access_token,
+    peek_refresh_token,
 )
-from .proxy import messages_proxy, sse_proxy
+from .proxy import UpstreamCredentialUnavailable, messages_proxy, sse_proxy
 
 try:
     from fastapi import FastAPI as _FastAPI
@@ -307,6 +309,18 @@ async def validate_mnemos_api_key(api_key: str) -> bool:
     return payload.get("authenticated") is True and bool(payload.get("user_id"))
 
 
+async def _validated_mcp_token(api_key: str) -> str | None:
+    try:
+        valid = await validate_mnemos_api_key(api_key)
+    except MnemosValidationUnavailable as exc:
+        raise UpstreamCredentialUnavailable(
+            "MNEMOS credential validation is temporarily unavailable"
+        ) from exc
+    if not valid:
+        return None
+    return _mcp_token_for_api_key(api_key)
+
+
 def _mcp_token_for_api_key(api_key: str) -> str | None:
     raw_map = os.getenv("MNEMOS_MCP_TOKENS", "").strip()
     if raw_map:
@@ -418,13 +432,20 @@ async def oauth_authorize_post(request: Request) -> Response:
             status_code=403,
         )
 
-    code = generate_code(
-        mcp_token,
-        params["client_id"],
-        params["code_challenge"],
-        params["code_challenge_method"],
-        params["redirect_uri"],
-    )
+    try:
+        code = generate_code(
+            api_key,
+            params["client_id"],
+            params["code_challenge"],
+            params["code_challenge_method"],
+            params["redirect_uri"],
+        )
+    except AuthorizationCodeLimitExceeded:
+        return _render_authorize_form(
+            params,
+            error="Too many authorization attempts. Please try again later.",
+            status_code=429,
+        )
     location = _redirect_uri_with_oauth_params(params["redirect_uri"], code, params["state"])
     try:
         from fastapi.responses import RedirectResponse
@@ -457,6 +478,17 @@ async def oauth_token(request: Request) -> Response:
                 "Invalid authorization code, expired code, or PKCE verifier.",
             )
 
+        try:
+            mcp_token = await _validated_mcp_token(api_key)
+        except UpstreamCredentialUnavailable:
+            return _oauth_error(
+                "temporarily_unavailable",
+                "MNEMOS credential validation is temporarily unavailable.",
+                status_code=503,
+            )
+        if mcp_token is None:
+            return _oauth_error("invalid_grant", "API key is revoked or no longer provisioned.")
+
         access_token, refresh_token = issue_access_token(api_key, CONNECTOR_JWT_SECRET)
         return _token_response(access_token, refresh_token)
 
@@ -464,6 +496,20 @@ async def oauth_token(request: Request) -> Response:
         refresh_token = str(form.get("refresh_token", ""))
         if not refresh_token:
             return _oauth_error("invalid_request", "Missing refresh_token.")
+
+        api_key = peek_refresh_token(refresh_token)
+        if api_key is None:
+            return _oauth_error("invalid_grant", "Invalid refresh_token.")
+        try:
+            mcp_token = await _validated_mcp_token(api_key)
+        except UpstreamCredentialUnavailable:
+            return _oauth_error(
+                "temporarily_unavailable",
+                "MNEMOS credential validation is temporarily unavailable.",
+                status_code=503,
+            )
+        if mcp_token is None:
+            return _oauth_error("invalid_grant", "API key is revoked or no longer provisioned.")
 
         exchanged = exchange_refresh_token(refresh_token, CONNECTOR_JWT_SECRET)
         if exchanged is None:
@@ -477,12 +523,16 @@ async def oauth_token(request: Request) -> Response:
 
 @app.get("/sse")
 async def sse(request: Request) -> Response:
-    return await sse_proxy(request, MNEMOS_MCP_URL, CONNECTOR_JWT_SECRET)
+    return await sse_proxy(
+        request, MNEMOS_MCP_URL, CONNECTOR_JWT_SECRET, _validated_mcp_token
+    )
 
 
 @app.post("/messages/")
 async def messages(request: Request) -> Response:
-    return await messages_proxy(request, MNEMOS_MCP_URL, CONNECTOR_JWT_SECRET)
+    return await messages_proxy(
+        request, MNEMOS_MCP_URL, CONNECTOR_JWT_SECRET, _validated_mcp_token
+    )
 
 
 def _parse_bind(bind: str) -> tuple[str, int]:

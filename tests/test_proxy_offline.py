@@ -122,3 +122,32 @@ async def test_messages_proxy_forwards_all_query_parameters(
         ("tag", "two"),
     ]
     assert posted["timeout"] == ("timeout", 30.0)
+
+
+@pytest.mark.asyncio
+async def test_messages_proxy_rejects_revoked_bound_api_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    upstream_called = False
+
+    async def revoked(api_key: str) -> str | None:
+        assert api_key == "original-api-key"
+        return None
+
+    def fail_httpx():
+        nonlocal upstream_called
+        upstream_called = True
+        raise AssertionError("revoked credentials must not reach MCP")
+
+    monkeypatch.setattr(proxy, "verify_access_token", lambda *_args: "original-api-key")
+    monkeypatch.setattr(proxy, "_httpx_module", fail_httpx)
+
+    response = await proxy.messages_proxy(
+        _MessagesRequest([b"message"]),
+        "http://mnemos.test",
+        "jwt-secret",
+        revoked,
+    )
+
+    assert response.status_code == 401
+    assert upstream_called is False
