@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html
+import hmac
 import logging
 import os
 from collections.abc import Callable
@@ -317,7 +318,13 @@ def _mcp_token_for_api_key(api_key: str) -> str | None:
                 return parts[1]
         return None
 
-    return os.getenv("MNEMOS_MCP_TOKEN", "").strip() or None
+    shared_token = os.getenv("MNEMOS_MCP_TOKEN", "").strip()
+    single_user_api_key = os.getenv("CONNECTOR_SINGLE_USER_API_KEY", "").strip()
+    if not shared_token or not single_user_api_key:
+        return None
+    if not hmac.compare_digest(api_key.encode(), single_user_api_key.encode()):
+        return None
+    return shared_token
 
 
 @app.get("/.well-known/oauth-authorization-server")

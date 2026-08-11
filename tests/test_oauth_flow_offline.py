@@ -96,7 +96,11 @@ async def client(monkeypatch: pytest.MonkeyPatch) -> httpx.AsyncClient:
         return api_key == "valid-test-key"
 
     monkeypatch.setattr(server_module, "validate_mnemos_api_key", fake_validate_mnemos_api_key)
-    monkeypatch.setenv("MNEMOS_MCP_TOKEN", "configured-mcp-token")
+    monkeypatch.delenv("MNEMOS_MCP_TOKEN", raising=False)
+    monkeypatch.setenv(
+        "MNEMOS_MCP_TOKENS",
+        "test-user:configured-mcp-token:valid-test-key",
+    )
     transport = httpx.ASGITransport(app=server_module.app)
     async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as test_client:
         yield test_client
@@ -484,6 +488,49 @@ async def test_authorize_uses_provisioned_per_user_mcp_token(
             authorize_params["client_id"],
         )
         == "user-mcp-token"
+    )
+
+
+async def test_shared_token_requires_explicit_matching_single_user_key(
+    client: httpx.AsyncClient,
+    authorize_params: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("MNEMOS_MCP_TOKENS", raising=False)
+    monkeypatch.setenv("MNEMOS_MCP_TOKEN", "shared-mcp-token")
+    monkeypatch.delenv("CONNECTOR_SINGLE_USER_API_KEY", raising=False)
+
+    response = await client.post(
+        "/oauth/authorize",
+        data={**authorize_params, "mnemos_api_key": "valid-test-key"},
+    )
+
+    assert response.status_code == 403
+    assert "not provisioned for MCP access" in response.text
+    assert oauth._entry_count_for_test("code") == 0
+
+
+async def test_shared_token_accepts_only_configured_single_user_key(
+    client: httpx.AsyncClient,
+    authorize_params: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("MNEMOS_MCP_TOKENS", raising=False)
+    monkeypatch.setenv("MNEMOS_MCP_TOKEN", "shared-mcp-token")
+    monkeypatch.setenv("CONNECTOR_SINGLE_USER_API_KEY", "valid-test-key")
+
+    assert server_module._mcp_token_for_api_key("another-valid-user-key") is None
+
+    code = await _authorize_for_code(client, authorize_params)
+
+    assert (
+        oauth.consume_code(
+            code,
+            "correct-verifier",
+            authorize_params["redirect_uri"],
+            authorize_params["client_id"],
+        )
+        == "shared-mcp-token"
     )
 
 

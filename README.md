@@ -16,7 +16,8 @@ claim from that JWT as the upstream bearer token for MCP proxy requests.
 - A running MNEMOS REST API and MCP HTTP server. They are separate MNEMOS
   applications and default to PYTHIA ports `5002` and `5003`, respectively.
 - MCP bearer credentials provisioned identically in the connector and MCP
-  server through `MNEMOS_MCP_TOKEN` or `MNEMOS_MCP_TOKENS`.
+  server through per-user `MNEMOS_MCP_TOKENS`, or through `MNEMOS_MCP_TOKEN`
+  plus `CONNECTOR_SINGLE_USER_API_KEY` for an explicit single-user deployment.
 - A strong `CONNECTOR_JWT_SECRET` value with at least 32 characters.
 - TLS termination for production OAuth traffic. Terminate HTTPS in front of this
   service with nginx or an equivalent reverse proxy.
@@ -34,8 +35,9 @@ pip install mnemos-bridge-claude-connector
 | `MNEMOS_API_URL` | No | `http://192.168.207.67:5002` | Base URL for the MNEMOS REST API used to validate user API keys. |
 | `MNEMOS_MCP_URL` | No | `http://192.168.207.67:5003` | Base URL for the MNEMOS MCP HTTP/SSE server started by `mnemos serve mcp-http`. |
 | `MNEMOS_BACKEND_URL` | No | None | Deprecated compatibility setting used for both URLs when the deployment combines both applications behind one path-routing proxy. Explicit API and MCP URLs take precedence. |
-| `MNEMOS_MCP_TOKEN` | One MCP token setting is required | None | Shared bearer token configured on the MNEMOS MCP server. This uses the MCP server's shared backend identity. |
+| `MNEMOS_MCP_TOKEN` | Single-user mode only | None | Shared bearer token configured on the MNEMOS MCP server. Requires `CONNECTOR_SINGLE_USER_API_KEY`; other valid MNEMOS users are rejected. |
 | `MNEMOS_MCP_TOKENS` | One MCP token setting is required | None | Per-user MCP mapping in the MNEMOS server's `user_id:api_key` or `user_id:mcp_token:api_key` format. The connector accepts authorization only for API keys in this map. |
+| `CONNECTOR_SINGLE_USER_API_KEY` | Required with `MNEMOS_MCP_TOKEN` | None | The one MNEMOS API key allowed to authorize in shared-token mode. Do not set this in per-user mode. |
 | `CONNECTOR_JWT_SECRET` | Yes | None | HS256 signing secret for connector access tokens. |
 | `CONNECTOR_BIND` | No | `127.0.0.1:8089` | Host and port used by `mnemos-claude-connector`. Bind an explicit non-loopback address only behind TLS/reverse-proxy controls. |
 | `CONNECTOR_PUBLIC_URL` | No | `http://localhost:8089` | Public issuer and endpoint base URL advertised to Claude.ai. |
