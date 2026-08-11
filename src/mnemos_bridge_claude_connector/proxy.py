@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 from collections.abc import AsyncIterator
 from typing import TYPE_CHECKING, Any
@@ -34,6 +35,7 @@ def _json_response(payload: dict[str, str], status_code: int) -> Response:
 
 
 _DEFAULT_MAX_BODY_BYTES = 5 * 1024 * 1024
+_DEFAULT_MESSAGE_TIMEOUT_SECONDS = 30.0
 _HOP_BY_HOP_HEADERS = {
     "authorization",
     "connection",
@@ -63,6 +65,14 @@ def _positive_int(raw: str | None) -> int | None:
 
 def _max_body_bytes() -> int:
     return _positive_int(os.getenv("CONNECTOR_MAX_BODY_BYTES")) or _DEFAULT_MAX_BODY_BYTES
+
+
+def _message_timeout_seconds() -> float:
+    try:
+        value = float(os.getenv("CONNECTOR_MESSAGE_TIMEOUT_SECONDS", ""))
+    except ValueError:
+        return _DEFAULT_MESSAGE_TIMEOUT_SECONDS
+    return value if math.isfinite(value) and value > 0 else _DEFAULT_MESSAGE_TIMEOUT_SECONDS
 
 
 async def _read_body_limited(request: Request) -> bytes:
@@ -173,7 +183,8 @@ async def messages_proxy(request: Request, backend_url: str, jwt_secret: str) ->
 
     httpx = _httpx_module()
     try:
-        async with httpx.AsyncClient(timeout=None) as client:
+        timeout = httpx.Timeout(_message_timeout_seconds())
+        async with httpx.AsyncClient(timeout=timeout) as client:
             upstream = await client.post(
                 f"{backend_url.rstrip('/')}/messages/",
                 content=body,

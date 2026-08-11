@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import sys
+import tempfile
 from pathlib import Path
 
 import httpx
@@ -14,6 +15,9 @@ pytestmark = pytest.mark.skipif(
 )
 
 os.environ["CONNECTOR_JWT_SECRET"] = "integration-test-secret-with-enough-entropy"
+os.environ["CONNECTOR_TOKEN_STORE_PATH"] = os.path.join(
+    tempfile.gettempdir(), f"mnemos-connector-integration-{os.getpid()}.sqlite3"
+)
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
 from mnemos_bridge_claude_connector import oauth  # noqa: E402
@@ -26,7 +30,7 @@ async def test_live_messages_proxy_initialize(monkeypatch: pytest.MonkeyPatch) -
         pytest.skip("MNEMOS_TEST_API_KEY is not set")
 
     backend_url = os.environ["MNEMOS_TEST_BASE"].rstrip("/")
-    monkeypatch.setattr(server_module, "MNEMOS_BACKEND_URL", backend_url)
+    monkeypatch.setattr(server_module, "MNEMOS_MCP_URL", backend_url)
 
     access_token, _refresh_token = oauth.issue_access_token(
         api_key,

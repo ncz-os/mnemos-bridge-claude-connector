@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html
+import logging
 import os
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
@@ -25,12 +26,29 @@ except ModuleNotFoundError:
         from starlette.responses import Response
 
 
-MNEMOS_BACKEND_URL = os.getenv("MNEMOS_BACKEND_URL", "http://192.168.207.67:5003").rstrip("/")
+_LEGACY_BACKEND_URL = os.getenv("MNEMOS_BACKEND_URL", "").rstrip("/")
+MNEMOS_API_URL = (
+    os.getenv("MNEMOS_API_URL", "").rstrip("/")
+    or _LEGACY_BACKEND_URL
+    or "http://192.168.207.67:5002"
+)
+MNEMOS_MCP_URL = (
+    os.getenv("MNEMOS_MCP_URL", "").rstrip("/")
+    or _LEGACY_BACKEND_URL
+    or "http://192.168.207.67:5003"
+)
+# Compatibility alias for callers that imported the old setting directly.
+MNEMOS_BACKEND_URL = MNEMOS_MCP_URL
 CONNECTOR_BIND = os.getenv("CONNECTOR_BIND", "127.0.0.1:8089")
 CONNECTOR_PUBLIC_URL = os.getenv("CONNECTOR_PUBLIC_URL", "http://localhost:8089").rstrip("/")
 _DEFAULT_ALLOWED_REDIRECT_URIS = ("https://claude.ai/api/mcp/auth_callback",)
 _MIN_JWT_SECRET_LENGTH = 32
 _TRUTHY = {"1", "true", "yes", "on"}
+logger = logging.getLogger(__name__)
+
+
+class MnemosValidationUnavailable(RuntimeError):
+    pass
 
 
 def _env_truthy(name: str) -> bool:
@@ -267,19 +285,39 @@ async def validate_mnemos_api_key(api_key: str) -> bool:
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             response = await client.get(
-                f"{MNEMOS_BACKEND_URL}/auth/oauth/me",
+                f"{MNEMOS_API_URL}/auth/oauth/me",
                 headers={"Authorization": f"Bearer {api_key}"},
             )
-    except httpx.HTTPError:
-        return False
+    except httpx.HTTPError as exc:
+        raise MnemosValidationUnavailable("MNEMOS API key validation is unavailable") from exc
 
-    if response.status_code != 200:
+    if response.status_code in {401, 403}:
         return False
+    if response.status_code != 200:
+        raise MnemosValidationUnavailable(
+            f"MNEMOS API key validation returned HTTP {response.status_code}"
+        )
     try:
         payload = response.json()
-    except ValueError:
-        return False
+    except ValueError as exc:
+        raise MnemosValidationUnavailable(
+            "MNEMOS API key validation returned an invalid response"
+        ) from exc
     return payload.get("authenticated") is True and bool(payload.get("user_id"))
+
+
+def _mcp_token_for_api_key(api_key: str) -> str | None:
+    raw_map = os.getenv("MNEMOS_MCP_TOKENS", "").strip()
+    if raw_map:
+        for item in raw_map.split(","):
+            parts = [part.strip() for part in item.strip().split(":", 2)]
+            if len(parts) == 2 and parts[0] and parts[1] and api_key == parts[1]:
+                return parts[1]
+            if len(parts) == 3 and all(parts) and api_key == parts[2]:
+                return parts[1]
+        return None
+
+    return os.getenv("MNEMOS_MCP_TOKEN", "").strip() or None
 
 
 @app.get("/.well-known/oauth-authorization-server")
@@ -301,7 +339,14 @@ async def openid_configuration() -> dict[str, object]:
 
 @app.get("/oauth/authorize")
 async def oauth_authorize_get(request: Request) -> Response:
-    return _render_authorize_form(_request_params(request))
+    params = _request_params(request)
+    if not params["client_id"].strip():
+        return _render_authorize_form(
+            params,
+            error="Missing client_id. Please try again.",
+            status_code=400,
+        )
+    return _render_authorize_form(params)
 
 
 @app.post("/oauth/authorize")
@@ -309,6 +354,13 @@ async def oauth_authorize_post(request: Request) -> Response:
     form = await request.form()
     params = _form_params(form)
     api_key = str(form.get("mnemos_api_key", "")).strip()
+
+    if not params["client_id"].strip():
+        return _render_authorize_form(
+            params,
+            error="Missing client_id. Please try again.",
+            status_code=400,
+        )
 
     if params["response_type"] != "code":
         return _render_authorize_form(
@@ -338,11 +390,29 @@ async def oauth_authorize_post(request: Request) -> Response:
             status_code=400,
         )
 
-    if not await validate_mnemos_api_key(api_key):
+    try:
+        key_is_valid = await validate_mnemos_api_key(api_key)
+    except MnemosValidationUnavailable:
+        logger.exception("MNEMOS API key validation failed")
+        return _render_authorize_form(
+            params,
+            error="MNEMOS is temporarily unavailable. Please try again later.",
+            status_code=503,
+        )
+
+    if not key_is_valid:
         return _render_authorize_form(params, error="Invalid API key. Please try again.")
 
+    mcp_token = _mcp_token_for_api_key(api_key)
+    if mcp_token is None:
+        return _render_authorize_form(
+            params,
+            error="This API key is not provisioned for MCP access.",
+            status_code=403,
+        )
+
     code = generate_code(
-        api_key,
+        mcp_token,
         params["client_id"],
         params["code_challenge"],
         params["code_challenge_method"],
@@ -400,12 +470,12 @@ async def oauth_token(request: Request) -> Response:
 
 @app.get("/sse")
 async def sse(request: Request) -> Response:
-    return await sse_proxy(request, MNEMOS_BACKEND_URL, CONNECTOR_JWT_SECRET)
+    return await sse_proxy(request, MNEMOS_MCP_URL, CONNECTOR_JWT_SECRET)
 
 
 @app.post("/messages/")
 async def messages(request: Request) -> Response:
-    return await messages_proxy(request, MNEMOS_BACKEND_URL, CONNECTOR_JWT_SECRET)
+    return await messages_proxy(request, MNEMOS_MCP_URL, CONNECTOR_JWT_SECRET)
 
 
 def _parse_bind(bind: str) -> tuple[str, int]:

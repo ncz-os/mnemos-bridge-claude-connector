@@ -83,8 +83,8 @@ async def test_messages_proxy_forwards_all_query_parameters(
         headers: dict[str, str] = {}
 
     class _Client:
-        def __init__(self, *, timeout: None):
-            pass
+        def __init__(self, *, timeout: object):
+            posted["timeout"] = timeout
 
         async def __aenter__(self):
             return self
@@ -100,6 +100,10 @@ async def test_messages_proxy_forwards_all_query_parameters(
     class _Httpx:
         AsyncClient = _Client
         HTTPError = Exception
+
+        @staticmethod
+        def Timeout(value: float) -> tuple[str, float]:
+            return ("timeout", value)
 
     monkeypatch.setattr(proxy, "verify_access_token", lambda *_args: "mnemos-key")
     monkeypatch.setattr(proxy, "_httpx_module", lambda: _Httpx)
@@ -117,3 +121,4 @@ async def test_messages_proxy_forwards_all_query_parameters(
         ("tag", "one"),
         ("tag", "two"),
     ]
+    assert posted["timeout"] == ("timeout", 30.0)

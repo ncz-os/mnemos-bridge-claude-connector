@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -9,6 +11,9 @@ import jwt
 
 
 os.environ["CONNECTOR_JWT_SECRET"] = "offline-test-secret-with-enough-entropy"
+os.environ["CONNECTOR_TOKEN_STORE_PATH"] = os.path.join(
+    tempfile.gettempdir(), f"mnemos-connector-jwt-{os.getpid()}.sqlite3"
+)
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from mnemos_bridge_claude_connector import oauth  # noqa: E402
@@ -19,9 +24,7 @@ JWT_SECRET_B = "secret-b-with-enough-entropy-for-hs256"
 
 
 def setup_function() -> None:
-    oauth._code_store.clear()
-    oauth._access_store.clear()
-    oauth._refresh_store.clear()
+    oauth._clear_store()
 
 
 def test_access_token_round_trip() -> None:
@@ -30,13 +33,45 @@ def test_access_token_round_trip() -> None:
     assert oauth.verify_access_token(token, JWT_SECRET_A) == "test-api-key"
 
 
+def test_oauth_entries_survive_a_fresh_process() -> None:
+    verifier = "persistent-verifier"
+    code = oauth.generate_code(
+        "test-api-key",
+        "client-id",
+        oauth._base64url_sha256(verifier),
+        "S256",
+        "https://example.test/callback",
+    )
+    access_token, refresh_token = oauth.issue_access_token("test-api-key", JWT_SECRET_A)
+    script = """
+from mnemos_bridge_claude_connector import oauth
+import sys
+code, verifier, access_token, refresh_token, secret = sys.argv[1:]
+print(oauth.consume_code(code, verifier, 'https://example.test/callback', 'client-id'))
+print(oauth.verify_access_token(access_token, secret))
+print(oauth.exchange_refresh_token(refresh_token, secret) is not None)
+"""
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "src")
+
+    result = subprocess.run(
+        [sys.executable, "-c", script, code, verifier, access_token, refresh_token, JWT_SECRET_A],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+    assert result.stdout.splitlines() == ["test-api-key", "test-api-key", "True"]
+
+
 def test_access_token_does_not_disclose_api_key_in_claims() -> None:
     token, _refresh_token = oauth.issue_access_token("test-api-key", JWT_SECRET_A)
 
     claims = jwt.decode(token, JWT_SECRET_A, algorithms=["HS256"])
 
     assert "test-api-key" not in claims.values()
-    assert claims["sub"] in oauth._access_store
+    assert oauth._entry_exists_for_test("access", claims["sub"])
 
 
 def test_access_token_wrong_secret_rejected() -> None:
@@ -78,6 +113,6 @@ def test_refresh_token_exchange_rejects_unknown_token() -> None:
 
 def test_refresh_token_exchange_rejects_expired_token() -> None:
     _token, refresh_token = oauth.issue_access_token("test-api-key", JWT_SECRET_A)
-    oauth._refresh_store[refresh_token].expires_at = time.time() - 1
+    oauth._set_expiry_for_test("refresh", refresh_token, time.time() - 1)
 
     assert oauth.exchange_refresh_token(refresh_token, JWT_SECRET_A) is None
