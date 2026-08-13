@@ -1,10 +1,10 @@
 [project]
 name = 'mnemos-bridge-claude-connector'
-version = '0.1.0'
+version = '0.1.1'
 requires-python = '>=3.11'
 license = {text = 'Apache-2.0'}
 dependencies = [
-  'mnemos-bridge-core>=0.1.0',
+  'mnemos-bridge-core>=0.1.4',
   'fastapi>=0.115',
   'uvicorn[standard]>=0.30',
   'starlette>=0.40',

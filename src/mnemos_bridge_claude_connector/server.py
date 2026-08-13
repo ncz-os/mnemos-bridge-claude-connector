@@ -88,7 +88,7 @@ def _build_app() -> Any:
     if _FastAPI is None:
         return _MissingDependencyApp()
 
-    return _FastAPI(title="MNEMOS Claude Connector", version="0.1.0")
+    return _FastAPI(title="MNEMOS Claude Connector", version="0.1.1")
 
 
 app = _build_app()
