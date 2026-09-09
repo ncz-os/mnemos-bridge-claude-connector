@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import logging
 import os
 import subprocess
 import sys
@@ -496,6 +497,45 @@ async def test_validate_mnemos_api_key_raises_on_connection_failure(
 
     with pytest.raises(server_module.MnemosValidationUnavailable):
         await server_module.validate_mnemos_api_key("valid-test-key")
+
+
+async def test_validation_backend_credentials_are_redacted_from_exception_and_log(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    backend_url = (
+        "https://validation-user:userinfo-secret@mnemos.test/api?bearer_token=query-secret"
+    )
+
+    class _Client:
+        def __init__(self, *, timeout: float):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args: object) -> None:
+            return None
+
+        async def get(self, url: str, **_kwargs: object):
+            request = httpx.Request("GET", url)
+            raise httpx.ConnectError(f"request failed for {url}", request=request)
+
+    monkeypatch.setattr(httpx, "AsyncClient", _Client)
+    monkeypatch.setattr(server_module, "MNEMOS_API_URL", backend_url)
+
+    caplog.set_level(logging.ERROR, logger=server_module.__name__)
+    with pytest.raises(server_module.MnemosValidationUnavailable) as exc_info:
+        try:
+            await server_module.validate_mnemos_api_key("valid-test-key")
+        except server_module.MnemosValidationUnavailable:
+            server_module.logger.exception("MNEMOS API key validation failed")
+            raise
+
+    assert exc_info.value.__cause__ is None
+    assert "userinfo-secret" not in caplog.text
+    assert "query-secret" not in caplog.text
+    assert "***REDACTED***" in caplog.text
 
 
 @pytest.mark.parametrize(

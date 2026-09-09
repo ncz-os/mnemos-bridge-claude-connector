@@ -6,6 +6,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import TYPE_CHECKING, Any
 
 from .oauth import verify_access_token
+from .redaction import install_httpx_log_redaction, redact_url_credentials
 
 try:
     from fastapi import Request
@@ -60,6 +61,9 @@ class UpstreamCredentialUnavailable(RuntimeError):
 
 
 CredentialResolver = Callable[[str], Awaitable[str | None]]
+
+
+install_httpx_log_redaction()
 
 
 def _positive_int(raw: str | None) -> int | None:
@@ -163,7 +167,11 @@ async def sse_proxy(
         api_key = await _resolve_upstream_token(principal, credential_resolver)
     except UpstreamCredentialUnavailable as exc:
         return _json_response(
-            {"error": "service_unavailable", "detail": str(exc)}, status_code=503
+            {
+                "error": "service_unavailable",
+                "detail": redact_url_credentials(str(exc)),
+            },
+            status_code=503,
         )
     if api_key is None:
         return _unauthorized_response()
@@ -179,16 +187,30 @@ async def sse_proxy(
     try:
         upstream = await stream_context.__aenter__()
     except httpx.HTTPError as exc:
-        await client.aclose()
-        return _json_response({"error": "bad_gateway", "detail": str(exc)}, status_code=502)
+        detail = redact_url_credentials(str(exc))
+        try:
+            await client.aclose()
+        except httpx.HTTPError as close_exc:
+            detail = redact_url_credentials(str(close_exc))
+        return _json_response(
+            {"error": "bad_gateway", "detail": detail},
+            status_code=502,
+        )
 
     async def body_iterator() -> AsyncIterator[bytes]:
         try:
             async for chunk in upstream.aiter_bytes():
                 yield chunk
+        except httpx.HTTPError as exc:
+            raise RuntimeError(redact_url_credentials(str(exc))) from None
         finally:
-            await stream_context.__aexit__(None, None, None)
-            await client.aclose()
+            try:
+                try:
+                    await stream_context.__aexit__(None, None, None)
+                finally:
+                    await client.aclose()
+            except httpx.HTTPError as exc:
+                raise RuntimeError(redact_url_credentials(str(exc))) from None
 
     return _streaming_response(body_iterator(), status_code=upstream.status_code)
 
@@ -210,7 +232,11 @@ async def messages_proxy(
         api_key = await _resolve_upstream_token(principal, credential_resolver)
     except UpstreamCredentialUnavailable as exc:
         return _json_response(
-            {"error": "service_unavailable", "detail": str(exc)}, status_code=503
+            {
+                "error": "service_unavailable",
+                "detail": redact_url_credentials(str(exc)),
+            },
+            status_code=503,
         )
     if api_key is None:
         return _unauthorized_response()
@@ -234,7 +260,10 @@ async def messages_proxy(
                 params=request.query_params.multi_items(),
             )
     except httpx.HTTPError as exc:
-        return _json_response({"error": "bad_gateway", "detail": str(exc)}, status_code=502)
+        return _json_response(
+            {"error": "bad_gateway", "detail": redact_url_credentials(str(exc))},
+            status_code=502,
+        )
 
     headers = {}
     content_type = upstream.headers.get("content-type")
