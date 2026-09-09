@@ -17,6 +17,7 @@ from .oauth import (
     peek_refresh_token,
 )
 from .proxy import UpstreamCredentialUnavailable, messages_proxy, sse_proxy
+from .redaction import install_httpx_log_redaction, redact_url_credentials
 
 try:
     from fastapi import FastAPI as _FastAPI
@@ -48,6 +49,9 @@ _DEFAULT_ALLOWED_REDIRECT_URIS = ("https://claude.ai/api/mcp/auth_callback",)
 _MIN_JWT_SECRET_LENGTH = 32
 _TRUTHY = {"1", "true", "yes", "on"}
 logger = logging.getLogger(__name__)
+
+
+install_httpx_log_redaction()
 
 
 class MnemosValidationUnavailable(RuntimeError):
@@ -292,7 +296,10 @@ async def validate_mnemos_api_key(api_key: str) -> bool:
                 headers={"Authorization": f"Bearer {api_key}"},
             )
     except httpx.HTTPError as exc:
-        raise MnemosValidationUnavailable("MNEMOS API key validation is unavailable") from exc
+        detail = redact_url_credentials(str(exc))
+        raise MnemosValidationUnavailable(
+            f"MNEMOS API key validation is unavailable: {detail}"
+        ) from None
 
     if response.status_code in {401, 403}:
         return False
