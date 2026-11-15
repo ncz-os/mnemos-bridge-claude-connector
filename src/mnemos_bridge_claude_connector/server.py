@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from .oauth import (
+    ApiKeyDecryptionError,
     AuthorizationCodeLimitExceeded,
     consume_code,
     exchange_refresh_token,
@@ -478,7 +479,14 @@ async def oauth_token(request: Request) -> Response:
                 "Missing code, code_verifier, redirect_uri, or client_id.",
             )
 
-        api_key = consume_code(code, code_verifier, redirect_uri, client_id)
+        try:
+            api_key = consume_code(code, code_verifier, redirect_uri, client_id)
+        except ApiKeyDecryptionError:
+            logger.warning("stored MNEMOS API key failed to decrypt; denying token exchange")
+            return _oauth_error(
+                "invalid_grant",
+                "Stored credential cannot be decrypted. Please re-authorize.",
+            )
         if api_key is None:
             return _oauth_error(
                 "invalid_grant",

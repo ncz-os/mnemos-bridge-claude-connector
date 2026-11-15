@@ -79,8 +79,14 @@ that are scoped to the MNEMOS API key they supplied.
   `CONNECTOR_TOKEN_STORE_PATH` on persistent storage. Replicas on different
   hosts must share that path through an appropriate filesystem or be kept
   session-affine; SQLite does not provide a distributed token store.
+- Stored MNEMOS API keys are encrypted at rest with AES-256-GCM. The
+  data-encryption key is derived via HKDF-SHA256 from `CONNECTOR_JWT_SECRET`;
+  no additional secret is needed. Rows written before this change stay
+  readable and are migrated to ciphertext on first read.
 - Keep `CONNECTOR_JWT_SECRET` private and rotate it according to your operator
-  policy. Rotating the secret invalidates existing access tokens.
+  policy. Rotating the secret invalidates existing access tokens. Stored API
+  keys can no longer be decrypted after rotation and fail closed (the user
+  must re-authorize); plan rotation accordingly.
 - Keep `CONNECTOR_ALLOWED_REDIRECT_URIS` narrow. Authorization codes are issued
   only to exact allowlisted redirect URIs so a malicious OAuth client cannot
   receive a code for a user-entered MNEMOS API key.
