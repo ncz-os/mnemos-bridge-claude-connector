@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 import hashlib
 import hmac
 import os
 import secrets
 import sqlite3
+import threading
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -81,30 +84,76 @@ def _store_path() -> Path:
     return base / "mnemos-bridge-claude-connector" / "oauth.sqlite3"
 
 
-def _connect() -> sqlite3.Connection:
-    path = _store_path()
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS connector_oauth_entries (
+    kind TEXT NOT NULL,
+    token TEXT NOT NULL,
+    api_key TEXT NOT NULL,
+    client_id TEXT,
+    code_challenge TEXT,
+    code_challenge_method TEXT,
+    redirect_uri TEXT,
+    expires_at REAL NOT NULL,
+    PRIMARY KEY (kind, token)
+)
+"""
+
+_lock = threading.Lock()
+_initialized_paths: set[str] = set()
+
+
+def _ensure_schema(connection: sqlite3.Connection) -> None:
+    connection.execute(_SCHEMA)
+    connection.commit()
+
+
+def _create_store_file(path: Path) -> None:
     file_descriptor = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
-    os.close(file_descriptor)
+    try:
+        os.fsync(file_descriptor)
+    finally:
+        os.close(file_descriptor)
     path.chmod(0o600)
-    connection = sqlite3.connect(path, timeout=10.0)
-    connection.execute("PRAGMA busy_timeout = 10000")
-    connection.execute(
-        """
-        CREATE TABLE IF NOT EXISTS connector_oauth_entries (
-            kind TEXT NOT NULL,
-            token TEXT NOT NULL,
-            api_key TEXT NOT NULL,
-            client_id TEXT,
-            code_challenge TEXT,
-            code_challenge_method TEXT,
-            redirect_uri TEXT,
-            expires_at REAL NOT NULL,
-            PRIMARY KEY (kind, token)
-        )
-        """
-    )
-    return connection
+
+
+@contextlib.contextmanager
+def _connect() -> Iterator[sqlite3.Connection]:
+    """Yield one fully-closed connection per call; file setup + DDL run once per path."""
+    path = _store_path()
+    key = str(path)
+    with _lock:
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        needs_init = key not in _initialized_paths
+        if needs_init:
+            _create_store_file(path)
+    with contextlib.closing(sqlite3.connect(path, timeout=10.0)) as connection:
+        connection.execute("PRAGMA busy_timeout = 10000")
+        connection.execute("PRAGMA journal_mode = WAL")
+        if needs_init:
+            with _lock:
+                if key not in _initialized_paths:
+                    _ensure_schema(connection)
+                    _initialized_paths.add(key)
+        try:
+            yield connection
+        except sqlite3.OperationalError as exc:
+            try:
+                connection.rollback()
+            except sqlite3.Error:
+                pass
+            if "no such table" in str(exc).lower():
+                # Store file was replaced out from under us; re-init next call.
+                with _lock:
+                    _initialized_paths.discard(key)
+            raise
+        except BaseException:
+            try:
+                connection.rollback()
+            except sqlite3.Error:
+                pass
+            raise
+        else:
+            connection.commit()
 
 
 def _save_entry(
@@ -213,9 +262,7 @@ def generate_code(
             outstanding >= _MAX_OUTSTANDING_CODES_PER_PRINCIPAL_CLIENT
             or recent_issuances >= _MAX_CODE_ISSUANCES_PER_PRINCIPAL_CLIENT
         ):
-            raise AuthorizationCodeLimitExceeded(
-                "authorization code issuance limit exceeded"
-            )
+            raise AuthorizationCodeLimitExceeded("authorization code issuance limit exceeded")
         connection.execute(
             """
             INSERT INTO connector_oauth_entries (
