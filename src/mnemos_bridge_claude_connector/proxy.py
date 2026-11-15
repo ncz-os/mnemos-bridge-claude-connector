@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import math
 import os
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -26,21 +28,27 @@ def _httpx_module() -> Any:
     return httpx
 
 
-def _json_response(payload: dict[str, str], status_code: int) -> Response:
+def _json_response(
+    payload: dict[str, str], status_code: int, headers: dict[str, str] | None = None
+) -> Response:
     try:
         from fastapi.responses import JSONResponse
     except ModuleNotFoundError as exc:
         raise RuntimeError("fastapi is required to build proxy responses") from exc
 
-    return JSONResponse(payload, status_code=status_code)
+    return JSONResponse(payload, status_code=status_code, headers=headers)
 
 
 _DEFAULT_MAX_BODY_BYTES = 5 * 1024 * 1024
 _DEFAULT_MESSAGE_TIMEOUT_SECONDS = 30.0
+_DEFAULT_SSE_IDLE_TIMEOUT_SECONDS = 300.0
+_DEFAULT_MAX_STREAMS_PER_PRINCIPAL = 4
 _HOP_BY_HOP_HEADERS = {
     "authorization",
     "connection",
     "content-length",
+    "cookie",
+    "forwarded",
     "host",
     "keep-alive",
     "proxy-authenticate",
@@ -50,6 +58,10 @@ _HOP_BY_HOP_HEADERS = {
     "transfer-encoding",
     "upgrade",
 }
+_FORWARDED_HEADER_PREFIX = "x-forwarded-"
+
+_active_sse_streams: dict[str, int] = {}
+_sse_streams_lock = asyncio.Lock()
 
 
 class _PayloadTooLarge(Exception):
@@ -84,6 +96,39 @@ def _message_timeout_seconds() -> float:
     except ValueError:
         return _DEFAULT_MESSAGE_TIMEOUT_SECONDS
     return value if math.isfinite(value) and value > 0 else _DEFAULT_MESSAGE_TIMEOUT_SECONDS
+
+
+def _sse_idle_timeout_seconds() -> float:
+    try:
+        value = float(os.getenv("CONNECTOR_SSE_IDLE_TIMEOUT_SECONDS", ""))
+    except ValueError:
+        return _DEFAULT_SSE_IDLE_TIMEOUT_SECONDS
+    return value if math.isfinite(value) and value > 0 else _DEFAULT_SSE_IDLE_TIMEOUT_SECONDS
+
+
+def _max_streams_per_principal() -> int:
+    return _positive_int(os.getenv("CONNECTOR_MAX_STREAMS_PER_PRINCIPAL")) or (
+        _DEFAULT_MAX_STREAMS_PER_PRINCIPAL
+    )
+
+
+async def _try_acquire_sse_slot(principal: str) -> bool:
+    limit = _max_streams_per_principal()
+    async with _sse_streams_lock:
+        active = _active_sse_streams.get(principal, 0)
+        if active >= limit:
+            return False
+        _active_sse_streams[principal] = active + 1
+        return True
+
+
+async def _release_sse_slot(principal: str) -> None:
+    async with _sse_streams_lock:
+        active = _active_sse_streams.get(principal, 0)
+        if active <= 1:
+            _active_sse_streams.pop(principal, None)
+        else:
+            _active_sse_streams[principal] = active - 1
 
 
 async def _read_body_limited(request: Request) -> bytes:
@@ -128,11 +173,13 @@ def extract_bearer(request: Request) -> str | None:
 
 
 def _headers_with_swapped_authorization(request: Request, api_key: str) -> dict[str, str]:
-    headers = {
-        name: value
-        for name, value in request.headers.items()
-        if name.lower() not in _HOP_BY_HOP_HEADERS
-    }
+    def _stripped(name: str) -> bool:
+        lowered = name.lower()
+        if lowered in _HOP_BY_HOP_HEADERS:
+            return True
+        return lowered.startswith(_FORWARDED_HEADER_PREFIX)
+
+    headers = {name: value for name, value in request.headers.items() if not _stripped(name)}
     headers["Authorization"] = f"Bearer {api_key}"
     return headers
 
@@ -176,8 +223,19 @@ async def sse_proxy(
     if api_key is None:
         return _unauthorized_response()
 
+    if not await _try_acquire_sse_slot(principal):
+        return _json_response(
+            {"error": "too_many_streams"},
+            status_code=429,
+            headers={"Retry-After": "60"},
+        )
+
     httpx = _httpx_module()
-    client = httpx.AsyncClient(timeout=None)
+    try:
+        client = httpx.AsyncClient(timeout=None)
+    except Exception:
+        await _release_sse_slot(principal)
+        raise
     stream_context = client.stream(
         "GET",
         f"{backend_url.rstrip('/')}/sse",
@@ -188,31 +246,52 @@ async def sse_proxy(
         upstream = await stream_context.__aenter__()
     except httpx.HTTPError as exc:
         detail = redact_url_credentials(str(exc))
-        try:
+        with contextlib.suppress(Exception):
             await client.aclose()
-        except httpx.HTTPError as close_exc:
-            detail = redact_url_credentials(str(close_exc))
+        await _release_sse_slot(principal)
         return _json_response(
             {"error": "bad_gateway", "detail": detail},
             status_code=502,
         )
+    except BaseException:
+        await _release_sse_slot(principal)
+        with contextlib.suppress(Exception):
+            await client.aclose()
+        raise
 
     async def body_iterator() -> AsyncIterator[bytes]:
+        idle_timeout = _sse_idle_timeout_seconds()
+        upstream_iter = upstream.aiter_bytes()
         try:
-            async for chunk in upstream.aiter_bytes():
+            while True:
+                try:
+                    async with asyncio.timeout(idle_timeout):
+                        chunk = await upstream_iter.__anext__()
+                except TimeoutError:
+                    return
+                except StopAsyncIteration:
+                    return
                 yield chunk
         except httpx.HTTPError as exc:
             raise RuntimeError(redact_url_credentials(str(exc))) from None
         finally:
-            try:
-                try:
-                    await stream_context.__aexit__(None, None, None)
-                finally:
-                    await client.aclose()
-            except httpx.HTTPError as exc:
-                raise RuntimeError(redact_url_credentials(str(exc))) from None
+            with contextlib.suppress(Exception):
+                await asyncio.shield(stream_context.__aexit__(None, None, None))
+            with contextlib.suppress(Exception):
+                await asyncio.shield(client.aclose())
+            await asyncio.shield(_release_sse_slot(principal))
 
-    return _streaming_response(body_iterator(), status_code=upstream.status_code)
+    try:
+        return _streaming_response(body_iterator(), status_code=upstream.status_code)
+    except BaseException:
+        # StreamingResponse construction failed: the generator's finally will
+        # never run, so release the slot here to avoid a permanent leak.
+        await asyncio.shield(_release_sse_slot(principal))
+        with contextlib.suppress(Exception):
+            await asyncio.shield(stream_context.__aexit__(None, None, None))
+        with contextlib.suppress(Exception):
+            await asyncio.shield(client.aclose())
+        raise
 
 
 async def messages_proxy(
