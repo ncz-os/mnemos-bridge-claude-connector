@@ -118,22 +118,30 @@ def _create_store_file(path: Path) -> None:
 
 @contextlib.contextmanager
 def _connect() -> Iterator[sqlite3.Connection]:
-    """Yield one fully-closed connection per call; file setup + DDL run once per path."""
+    """Yield one fully-closed connection per call; file setup + DDL run once per path.
+
+    One-time initialization (file setup + DDL + marking the path initialized)
+    happens atomically under a single ``_lock`` acquisition, before any
+    connection is yielded, so a concurrent caller can never observe a
+    connection without its schema present.
+    """
     path = _store_path()
     key = str(path)
     with _lock:
         path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        needs_init = key not in _initialized_paths
-        if needs_init:
+        if key not in _initialized_paths:
             _create_store_file(path)
+            init_connection = sqlite3.connect(path, timeout=10.0)
+            try:
+                init_connection.execute("PRAGMA busy_timeout = 10000")
+                init_connection.execute("PRAGMA journal_mode = WAL")
+                _ensure_schema(init_connection)
+            finally:
+                init_connection.close()
+            _initialized_paths.add(key)
     with contextlib.closing(sqlite3.connect(path, timeout=10.0)) as connection:
         connection.execute("PRAGMA busy_timeout = 10000")
         connection.execute("PRAGMA journal_mode = WAL")
-        if needs_init:
-            with _lock:
-                if key not in _initialized_paths:
-                    _ensure_schema(connection)
-                    _initialized_paths.add(key)
         try:
             yield connection
         except sqlite3.OperationalError as exc:
