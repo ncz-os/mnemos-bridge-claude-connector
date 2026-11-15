@@ -585,6 +585,41 @@ async def test_live_validation_resolves_all_supported_mcp_token_forms_and_reject
     assert await server_module._validated_mcp_token(api_key) == expected_mcp_token
 
 
+@pytest.mark.parametrize(
+    ("tokens", "valid_key", "expected_token"),
+    [
+        ("user:api-key", "api-key", "api-key"),
+        ("user:mcp-token:api-key", "api-key", "mcp-token"),
+    ],
+)
+def test_mcp_token_mapping_uses_constant_time_comparison(
+    monkeypatch: pytest.MonkeyPatch,
+    tokens: str,
+    valid_key: str,
+    expected_token: str,
+) -> None:
+    for name in (
+        "MNEMOS_MCP_TOKENS",
+        "MNEMOS_MCP_TOKEN",
+        "CONNECTOR_SINGLE_USER_API_KEY",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("MNEMOS_MCP_TOKENS", tokens)
+
+    calls: list[tuple[bytes, bytes]] = []
+    real_compare_digest = server_module.hmac.compare_digest
+
+    def spy(first: bytes, second: bytes) -> bool:
+        calls.append((first, second))
+        return real_compare_digest(first, second)
+
+    monkeypatch.setattr(server_module.hmac, "compare_digest", spy)
+
+    assert server_module._mcp_token_for_api_key("wrong-key") is None
+    assert calls, "expected hmac.compare_digest to be used for MNEMOS_MCP_TOKENS"
+    assert server_module._mcp_token_for_api_key(valid_key) == expected_token
+
+
 async def test_authorize_uses_provisioned_per_user_mcp_token(
     client: httpx.AsyncClient,
     authorize_params: dict[str, str],

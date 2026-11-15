@@ -329,13 +329,24 @@ async def _validated_mcp_token(api_key: str) -> str | None:
 
 
 def _mcp_token_for_api_key(api_key: str) -> str | None:
+    if not isinstance(api_key, str) or not api_key:
+        return None
     raw_map = os.getenv("MNEMOS_MCP_TOKENS", "").strip()
     if raw_map:
         for item in raw_map.split(","):
             parts = [part.strip() for part in item.strip().split(":", 2)]
-            if len(parts) == 2 and parts[0] and parts[1] and api_key == parts[1]:
+            if (
+                len(parts) == 2
+                and parts[0]
+                and parts[1]
+                and hmac.compare_digest(api_key.encode(), parts[1].encode())
+            ):
                 return parts[1]
-            if len(parts) == 3 and all(parts) and api_key == parts[2]:
+            if (
+                len(parts) == 3
+                and all(parts)
+                and hmac.compare_digest(api_key.encode(), parts[2].encode())
+            ):
                 return parts[1]
         return None
 
