@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import math
 import os
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -26,21 +28,33 @@ def _httpx_module() -> Any:
     return httpx
 
 
-def _json_response(payload: dict[str, str], status_code: int) -> Response:
+def _json_response(
+    payload: dict[str, str], status_code: int, headers: dict[str, str] | None = None
+) -> Response:
     try:
         from fastapi.responses import JSONResponse
     except ModuleNotFoundError as exc:
         raise RuntimeError("fastapi is required to build proxy responses") from exc
 
-    return JSONResponse(payload, status_code=status_code)
+    return JSONResponse(payload, status_code=status_code, headers=headers)
 
 
 _DEFAULT_MAX_BODY_BYTES = 5 * 1024 * 1024
 _DEFAULT_MESSAGE_TIMEOUT_SECONDS = 30.0
+_DEFAULT_SSE_IDLE_TIMEOUT_SECONDS = 300.0
+_DEFAULT_MAX_STREAMS_PER_PRINCIPAL = 4
+# Advisory backoff advertised in ``Retry-After`` when the per-principal stream
+# cap is reached. A slot frees when its stream ends (an upstream event, an
+# idle-timeout cutoff, or a client disconnect), so there is no exact wait time;
+# a small window keeps well-behaved clients retrying promptly instead of
+# sitting out the full idle-timeout window.
+_RETRY_AFTER_SECONDS = 5
 _HOP_BY_HOP_HEADERS = {
     "authorization",
     "connection",
     "content-length",
+    "cookie",
+    "forwarded",
     "host",
     "keep-alive",
     "proxy-authenticate",
@@ -50,6 +64,9 @@ _HOP_BY_HOP_HEADERS = {
     "transfer-encoding",
     "upgrade",
 }
+_FORWARDED_HEADER_PREFIX = "x-forwarded-"
+
+_active_sse_streams: dict[str, int] = {}
 
 
 class _PayloadTooLarge(Exception):
@@ -84,6 +101,45 @@ def _message_timeout_seconds() -> float:
     except ValueError:
         return _DEFAULT_MESSAGE_TIMEOUT_SECONDS
     return value if math.isfinite(value) and value > 0 else _DEFAULT_MESSAGE_TIMEOUT_SECONDS
+
+
+def _sse_idle_timeout_seconds() -> float:
+    try:
+        value = float(os.getenv("CONNECTOR_SSE_IDLE_TIMEOUT_SECONDS", ""))
+    except ValueError:
+        return _DEFAULT_SSE_IDLE_TIMEOUT_SECONDS
+    return value if math.isfinite(value) and value > 0 else _DEFAULT_SSE_IDLE_TIMEOUT_SECONDS
+
+
+def _max_streams_per_principal() -> int:
+    return _positive_int(os.getenv("CONNECTOR_MAX_STREAMS_PER_PRINCIPAL")) or (
+        _DEFAULT_MAX_STREAMS_PER_PRINCIPAL
+    )
+
+
+async def _try_acquire_sse_slot(principal: str) -> bool:
+    # The check-and-increment is a single synchronous step; inside the running
+    # event loop it is atomic without a lock (there is no ``await`` between
+    # read and write). A ``threading.Lock`` here was wrong for an async app:
+    # it is a blocking primitive, so contention would stall the event-loop
+    # thread rather than yielding it.
+    limit = _max_streams_per_principal()
+    active = _active_sse_streams.get(principal, 0)
+    if active >= limit:
+        return False
+    _active_sse_streams[principal] = active + 1
+    return True
+
+
+async def _release_sse_slot(principal: str) -> None:
+    active = _active_sse_streams.get(principal, 0)
+    if active <= 1:
+        # Defensive: ``active <= 0`` covers a principal that was never tracked
+        # or already fully released -- drop any stale entry and never go
+        # negative.
+        _active_sse_streams.pop(principal, None)
+    else:
+        _active_sse_streams[principal] = active - 1
 
 
 async def _read_body_limited(request: Request) -> bytes:
@@ -128,11 +184,13 @@ def extract_bearer(request: Request) -> str | None:
 
 
 def _headers_with_swapped_authorization(request: Request, api_key: str) -> dict[str, str]:
-    headers = {
-        name: value
-        for name, value in request.headers.items()
-        if name.lower() not in _HOP_BY_HOP_HEADERS
-    }
+    def _stripped(name: str) -> bool:
+        lowered = name.lower()
+        if lowered in _HOP_BY_HOP_HEADERS:
+            return True
+        return lowered.startswith(_FORWARDED_HEADER_PREFIX)
+
+    headers = {name: value for name, value in request.headers.items() if not _stripped(name)}
     headers["Authorization"] = f"Bearer {api_key}"
     return headers
 
@@ -176,43 +234,118 @@ async def sse_proxy(
     if api_key is None:
         return _unauthorized_response()
 
+    if not await _try_acquire_sse_slot(principal):
+        return _json_response(
+            {"error": "too_many_streams"},
+            status_code=429,
+            headers={"Retry-After": str(_RETRY_AFTER_SECONDS)},
+        )
+
     httpx = _httpx_module()
-    client = httpx.AsyncClient(timeout=None)
+    # The SSE body is unbounded (read=None), so we do not set an overall client
+    # timeout. Instead, the connection/handshake is bounded below with an
+    # asyncio timeout, and each body read is guarded by the idle timeout inside
+    # the generator.
+    try:
+        client = httpx.AsyncClient(timeout=None)
+    except Exception:
+        # The client was never constructed, so only the slot needs releasing.
+        await _release_sse_slot(principal)
+        raise
     stream_context = client.stream(
         "GET",
         f"{backend_url.rstrip('/')}/sse",
         headers=_headers_with_swapped_authorization(request, api_key),
     )
 
+    # The HTTP client exists from construction onward, so it must always be
+    # closed. ``stream_owned`` gates only the context-manager exit: the stream
+    # context was never entered if ``__aenter__`` failed, and closing it
+    # unconditionally would risk a double-exit or an error on a failed stream.
+    stream_owned = False
+
+    async def teardown() -> None:
+        """Idempotent, cancellation-safe release of the upstream stream, the
+        HTTP client, and the per-principal SSE slot.
+
+        Every failure path funnels through this one place so cleanup is always
+        applied together -- never partially.
+
+        The three steps run in one shielded cleanup coroutine. The shield runs
+        that coroutine to completion even when the calling task is already
+        cancelled (e.g. a client disconnect that cancels the body iterator,
+        whose ``finally: await teardown()`` then executes inside that cancelled
+        task). Because ``CancelledError`` is a ``BaseException``,
+        ``contextlib.suppress`` is applied at the call site -- not inside the
+        steps -- so cancellation of the caller cannot interrupt the release.
+        There is deliberately no retry loop: inside a cancelled task the
+        ``await`` expressions raise immediately, so retrying in place would
+        spin without ever yielding to the event loop.
+        """
+
+        async def _release_all() -> None:
+            if stream_owned:
+                with contextlib.suppress(Exception):
+                    await stream_context.__aexit__(None, None, None)
+            with contextlib.suppress(Exception):
+                await client.aclose()
+            await _release_sse_slot(principal)
+
+        with contextlib.suppress(asyncio.CancelledError):
+            await asyncio.shield(_release_all())
+
     try:
-        upstream = await stream_context.__aenter__()
-    except httpx.HTTPError as exc:
-        detail = redact_url_credentials(str(exc))
-        try:
-            await client.aclose()
-        except httpx.HTTPError as close_exc:
-            detail = redact_url_credentials(str(close_exc))
+        # The same idle-timeout value also bounds the handshake window: an
+        # upstream that never completes the connection within it is treated as
+        # an unreachable gateway (502) rather than leaving the client waiting.
+        async with asyncio.timeout(_sse_idle_timeout_seconds()):
+            upstream = await stream_context.__aenter__()
+        stream_owned = True
+    except (httpx.HTTPError, TimeoutError) as exc:
+        # A TimeoutError from the bounded handshake (upstream unreachable during
+        # connect) is the same gateway failure mode as an httpx.HTTPError and is
+        # translated to the same 502 response rather than surfacing as a 500.
+        await teardown()
         return _json_response(
-            {"error": "bad_gateway", "detail": detail},
+            {"error": "bad_gateway", "detail": redact_url_credentials(str(exc))},
             status_code=502,
         )
+    except BaseException:
+        await teardown()
+        raise
 
     async def body_iterator() -> AsyncIterator[bytes]:
+        # Wrap only the read loop so an ``httpx.HTTPError`` raised inside
+        # ``__anext__`` is caught here, not left to escape the loop body.
+        # ``asyncio.timeout`` (TimeoutError) and ``StopAsyncIteration`` are
+        # handled inside the loop and never reach this handler.
+        idle_timeout = _sse_idle_timeout_seconds()
+        upstream_iter = upstream.aiter_bytes()
         try:
-            async for chunk in upstream.aiter_bytes():
+            while True:
+                try:
+                    async with asyncio.timeout(idle_timeout):
+                        chunk = await upstream_iter.__anext__()
+                except TimeoutError:
+                    return
+                except StopAsyncIteration:
+                    return
                 yield chunk
         except httpx.HTTPError as exc:
-            raise RuntimeError(redact_url_credentials(str(exc))) from None
+            # Preserve the original exception (and its traceback) so network
+            # failures stay debuggable; only the message is redacted.
+            raise RuntimeError(redact_url_credentials(str(exc))) from exc
         finally:
-            try:
-                try:
-                    await stream_context.__aexit__(None, None, None)
-                finally:
-                    await client.aclose()
-            except httpx.HTTPError as exc:
-                raise RuntimeError(redact_url_credentials(str(exc))) from None
+            await teardown()
 
-    return _streaming_response(body_iterator(), status_code=upstream.status_code)
+    try:
+        return _streaming_response(body_iterator(), status_code=upstream.status_code)
+    except BaseException:
+        # StreamingResponse construction failed: the generator's finally will
+        # never run, so release the slot and close resources here to avoid a
+        # permanent leak.
+        await teardown()
+        raise
 
 
 async def messages_proxy(
