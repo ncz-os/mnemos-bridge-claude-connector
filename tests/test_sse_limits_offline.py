@@ -163,3 +163,68 @@ async def test_sse_idle_upstream_closed_after_timeout(
     assert received == []
     # Slot released after the timed-out stream ends.
     assert proxy._active_sse_streams.get("principal-idle") in (None, 0)
+
+
+@pytest.mark.asyncio
+async def test_sse_handshake_failure_closes_client_and_releases_slot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CONNECTOR_MAX_STREAMS_PER_PRINCIPAL", "4")
+
+    telemetry: dict[str, bool] = {"client_closed": False}
+
+    class _HandshakeError(Exception):
+        pass
+
+    state = {"entered": False}
+
+    class _OkUpstream:
+        status_code = 200
+
+        async def aiter_bytes(self):
+            yield b"data: ok\n\n"
+
+    class _StreamContext:
+        async def __aenter__(self):
+            if not state["entered"]:
+                state["entered"] = True
+                raise _HandshakeError("handshake failed")
+            return _OkUpstream()
+
+        async def __aexit__(self, *_args: object):
+            return None
+
+    class _Client:
+        def stream(self, *_args: object, **kwargs: object):
+            return _StreamContext()
+
+        async def aclose(self):
+            telemetry["client_closed"] = True
+
+    class _Httpx:
+        @staticmethod
+        def AsyncClient(**kwargs):
+            return _Client()
+
+        HTTPError = RuntimeError
+
+    monkeypatch.setattr(proxy, "verify_access_token", lambda *_args: "principal-hs")
+    monkeypatch.setattr(proxy, "_httpx_module", lambda: _Httpx)
+    monkeypatch.setattr(
+        proxy, "_streaming_response", lambda body, status_code: (body, status_code)
+    )
+
+    # A non-httpx failure during the handshake propagates out of sse_proxy
+    # (it is not translated to a 502), but cleanup still runs.
+    with pytest.raises(_HandshakeError, match="handshake failed"):
+        await proxy.sse_proxy(_AuthRequest(), "http://mnemos.test", "jwt")
+
+    # The client was closed and the slot was released even though the stream
+    # was never entered.
+    assert telemetry["client_closed"] is True
+    assert proxy._active_sse_streams.get("principal-hs") in (None, 0)
+    # The slot was released: a fresh stream is admitted.
+    body, status = await proxy.sse_proxy(_AuthRequest(), "http://mnemos.test", "jwt")
+    assert status == 200
+    async for _ in body:
+        pass

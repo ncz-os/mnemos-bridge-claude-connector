@@ -245,6 +245,7 @@ async def sse_proxy(
     try:
         client = httpx.AsyncClient(timeout=None)
     except Exception:
+        # The client was never constructed, so only the slot needs releasing.
         await _release_sse_slot(principal)
         raise
     stream_context = client.stream(
@@ -253,32 +254,47 @@ async def sse_proxy(
         headers=_headers_with_swapped_authorization(request, api_key),
     )
 
-    # Track whether we actually own the stream context and client so the
-    # cleanup path (and the body generator) never double-closes them.
+    # The HTTP client exists from construction onward, so it must always be
+    # closed. ``stream_owned`` gates only the context-manager exit: the stream
+    # context was never entered if ``__aenter__`` failed, and closing it
+    # unconditionally would risk a double-exit or an error on a failed stream.
     stream_owned = False
-    client_owned = False
+
+    async def teardown() -> None:
+        """Idempotent, cancellation-safe release of the upstream stream, the
+        HTTP client, and the per-principal SSE slot.
+
+        Every failure path funnels through this one place so cleanup is always
+        applied together -- never partially -- and shielded so an in-flight
+        cancellation cannot leave the stream or slot half-released.
+        """
+        if stream_owned:
+            with contextlib.suppress(Exception):
+                await asyncio.shield(stream_context.__aexit__(None, None, None))
+        with contextlib.suppress(Exception):
+            await asyncio.shield(client.aclose())
+        await asyncio.shield(_release_sse_slot(principal))
 
     try:
         async with asyncio.timeout(_sse_idle_timeout_seconds()):
             upstream = await stream_context.__aenter__()
         stream_owned = True
-        client_owned = True
     except httpx.HTTPError as exc:
         detail = redact_url_credentials(str(exc))
-        with contextlib.suppress(Exception):
-            await client.aclose()
-        await _release_sse_slot(principal)
+        await teardown()
         return _json_response(
             {"error": "bad_gateway", "detail": detail},
             status_code=502,
         )
     except BaseException:
-        await _release_sse_slot(principal)
-        with contextlib.suppress(Exception):
-            await client.aclose()
+        await teardown()
         raise
 
     async def body_iterator() -> AsyncIterator[bytes]:
+        # Wrap only the read loop so an ``httpx.HTTPError`` raised inside
+        # ``__anext__`` is caught here, not left to escape the loop body.
+        # ``asyncio.timeout`` (TimeoutError) and ``StopAsyncIteration`` are
+        # handled inside the loop and never reach this handler.
         idle_timeout = _sse_idle_timeout_seconds()
         upstream_iter = upstream.aiter_bytes()
         try:
@@ -292,17 +308,11 @@ async def sse_proxy(
                     return
                 yield chunk
         except httpx.HTTPError as exc:
-            raise RuntimeError(redact_url_credentials(str(exc))) from None
+            # Preserve the original exception (and its traceback) so network
+            # failures stay debuggable; only the message is redacted.
+            raise RuntimeError(redact_url_credentials(str(exc))) from exc
         finally:
-            # Cancellation-safe teardown: shield the cleanup so an in-flight
-            # cancellation does not leave the stream or slot half-released.
-            if stream_owned:
-                with contextlib.suppress(Exception):
-                    await asyncio.shield(stream_context.__aexit__(None, None, None))
-            if client_owned:
-                with contextlib.suppress(Exception):
-                    await asyncio.shield(client.aclose())
-            await asyncio.shield(_release_sse_slot(principal))
+            await teardown()
 
     try:
         return _streaming_response(body_iterator(), status_code=upstream.status_code)
@@ -310,13 +320,7 @@ async def sse_proxy(
         # StreamingResponse construction failed: the generator's finally will
         # never run, so release the slot and close resources here to avoid a
         # permanent leak.
-        await asyncio.shield(_release_sse_slot(principal))
-        if stream_owned:
-            with contextlib.suppress(Exception):
-                await asyncio.shield(stream_context.__aexit__(None, None, None))
-        if client_owned:
-            with contextlib.suppress(Exception):
-                await asyncio.shield(client.aclose())
+        await teardown()
         raise
 
 

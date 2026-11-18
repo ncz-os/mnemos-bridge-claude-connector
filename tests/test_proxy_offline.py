@@ -200,6 +200,8 @@ async def test_sse_proxy_redacts_backend_url_credentials_from_streaming_errors(
 ) -> None:
     backend_url = "https://stream-user:userinfo-secret@mnemos.test?sig=query-secret"
 
+    telemetry: dict[str, bool] = {"stream_exited": False, "client_closed": False}
+
     class _Upstream:
         status_code = 200
 
@@ -213,7 +215,7 @@ async def test_sse_proxy_redacts_backend_url_credentials_from_streaming_errors(
             return _Upstream()
 
         async def __aexit__(self, *_args: object) -> None:
-            return None
+            telemetry["stream_exited"] = True
 
     class _Client:
         def __init__(self, *, timeout: object):
@@ -223,7 +225,7 @@ async def test_sse_proxy_redacts_backend_url_credentials_from_streaming_errors(
             return _StreamContext()
 
         async def aclose(self) -> None:
-            return None
+            telemetry["client_closed"] = True
 
     class _Httpx:
         AsyncClient = _Client
@@ -242,6 +244,11 @@ async def test_sse_proxy_redacts_backend_url_credentials_from_streaming_errors(
     assert "userinfo-secret" not in detail
     assert "query-secret" not in detail
     assert "***REDACTED***" in detail
+    # The original HTTPError is preserved as __cause__, not suppressed.
+    assert isinstance(exc_info.value.__cause__, _Httpx.HTTPError)
+    # Unified teardown ran despite the error escaping the body generator.
+    assert telemetry["stream_exited"] is True
+    assert telemetry["client_closed"] is True
 
 
 def test_httpx_request_log_redacts_backend_url_credentials(
