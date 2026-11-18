@@ -4,7 +4,6 @@ import asyncio
 import contextlib
 import math
 import os
-import threading
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import TYPE_CHECKING, Any
 
@@ -44,6 +43,12 @@ _DEFAULT_MAX_BODY_BYTES = 5 * 1024 * 1024
 _DEFAULT_MESSAGE_TIMEOUT_SECONDS = 30.0
 _DEFAULT_SSE_IDLE_TIMEOUT_SECONDS = 300.0
 _DEFAULT_MAX_STREAMS_PER_PRINCIPAL = 4
+# Advisory backoff advertised in ``Retry-After`` when the per-principal stream
+# cap is reached. A slot frees when its stream ends (an upstream event, an
+# idle-timeout cutoff, or a client disconnect), so there is no exact wait time;
+# a small window keeps well-behaved clients retrying promptly instead of
+# sitting out the full idle-timeout window.
+_RETRY_AFTER_SECONDS = 5
 _HOP_BY_HOP_HEADERS = {
     "authorization",
     "connection",
@@ -62,7 +67,6 @@ _HOP_BY_HOP_HEADERS = {
 _FORWARDED_HEADER_PREFIX = "x-forwarded-"
 
 _active_sse_streams: dict[str, int] = {}
-_sse_streams_lock = threading.Lock()
 
 
 class _PayloadTooLarge(Exception):
@@ -114,26 +118,28 @@ def _max_streams_per_principal() -> int:
 
 
 async def _try_acquire_sse_slot(principal: str) -> bool:
+    # The check-and-increment is a single synchronous step; inside the running
+    # event loop it is atomic without a lock (there is no ``await`` between
+    # read and write). A ``threading.Lock`` here was wrong for an async app:
+    # it is a blocking primitive, so contention would stall the event-loop
+    # thread rather than yielding it.
     limit = _max_streams_per_principal()
-    with _sse_streams_lock:
-        active = _active_sse_streams.get(principal, 0)
-        if active >= limit:
-            return False
-        _active_sse_streams[principal] = active + 1
-        return True
+    active = _active_sse_streams.get(principal, 0)
+    if active >= limit:
+        return False
+    _active_sse_streams[principal] = active + 1
+    return True
 
 
 async def _release_sse_slot(principal: str) -> None:
-    with _sse_streams_lock:
-        active = _active_sse_streams.get(principal, 0)
-        if active <= 0:
-            # Defensive: the principal was never tracked or already fully
-            # released; drop any stale entry and do not go negative.
-            _active_sse_streams.pop(principal, None)
-        elif active <= 1:
-            _active_sse_streams.pop(principal, None)
-        else:
-            _active_sse_streams[principal] = active - 1
+    active = _active_sse_streams.get(principal, 0)
+    if active <= 1:
+        # Defensive: ``active <= 0`` covers a principal that was never tracked
+        # or already fully released -- drop any stale entry and never go
+        # negative.
+        _active_sse_streams.pop(principal, None)
+    else:
+        _active_sse_streams[principal] = active - 1
 
 
 async def _read_body_limited(request: Request) -> bytes:
@@ -229,12 +235,10 @@ async def sse_proxy(
         return _unauthorized_response()
 
     if not await _try_acquire_sse_slot(principal):
-        # Advise retry after the idle-timeout window, not a hard-coded 60s.
-        retry_after = max(1, int(math.ceil(_sse_idle_timeout_seconds())))
         return _json_response(
             {"error": "too_many_streams"},
             status_code=429,
-            headers={"Retry-After": str(retry_after)},
+            headers={"Retry-After": str(_RETRY_AFTER_SECONDS)},
         )
 
     httpx = _httpx_module()
@@ -267,32 +271,33 @@ async def sse_proxy(
         Every failure path funnels through this one place so cleanup is always
         applied together -- never partially.
 
-        ``asyncio.shield`` protects the *inner* coroutine from cancellation, but
-        the ``await`` expression itself still raises ``CancelledError`` the
-        instant the calling task is cancelled (e.g. a client disconnect that
-        cancels the body iterator, whose ``finally: await teardown()`` then runs
-        inside an already-cancelled task). Because ``CancelledError`` is a
-        ``BaseException``, a bare ``contextlib.suppress(Exception)`` would not
-        catch it, and the remaining awaits -- including ``_release_sse_slot`` --
-        would never run, permanently leaking the per-principal slot and locking
-        the principal out of ``/sse``. The body therefore runs inside a loop
-        that swallows ``CancelledError`` and retries so every step completes.
+        The three steps run in one shielded cleanup coroutine. The shield runs
+        that coroutine to completion even when the calling task is already
+        cancelled (e.g. a client disconnect that cancels the body iterator,
+        whose ``finally: await teardown()`` then executes inside that cancelled
+        task). Because ``CancelledError`` is a ``BaseException``,
+        ``contextlib.suppress`` is applied at the call site -- not inside the
+        steps -- so cancellation of the caller cannot interrupt the release.
+        There is deliberately no retry loop: inside a cancelled task the
+        ``await`` expressions raise immediately, so retrying in place would
+        spin without ever yielding to the event loop.
         """
-        while True:
-            try:
-                if stream_owned:
-                    with contextlib.suppress(Exception):
-                        await asyncio.shield(stream_context.__aexit__(None, None, None))
+
+        async def _release_all() -> None:
+            if stream_owned:
                 with contextlib.suppress(Exception):
-                    await asyncio.shield(client.aclose())
-                await asyncio.shield(_release_sse_slot(principal))
-                break
-            except asyncio.CancelledError:
-                # The task running teardown was cancelled: retry so all three
-                # shielded steps finish before we exit.
-                continue
+                    await stream_context.__aexit__(None, None, None)
+            with contextlib.suppress(Exception):
+                await client.aclose()
+            await _release_sse_slot(principal)
+
+        with contextlib.suppress(asyncio.CancelledError):
+            await asyncio.shield(_release_all())
 
     try:
+        # The same idle-timeout value also bounds the handshake window: an
+        # upstream that never completes the connection within it is treated as
+        # an unreachable gateway (502) rather than leaving the client waiting.
         async with asyncio.timeout(_sse_idle_timeout_seconds()):
             upstream = await stream_context.__aenter__()
         stream_owned = True

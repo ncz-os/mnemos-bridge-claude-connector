@@ -44,8 +44,8 @@ pip install mnemos-bridge-claude-connector
 | `CONNECTOR_ALLOWED_REDIRECT_URIS` | No | `https://claude.ai/api/mcp/auth_callback` | Comma-separated exact OAuth redirect URI allowlist. Loopback HTTP is allowed for local testing; production redirects should be HTTPS. |
 | `CONNECTOR_MAX_BODY_BYTES` | No | `5242880` | Maximum proxied `/messages/` request body size. |
 | `CONNECTOR_MESSAGE_TIMEOUT_SECONDS` | No | `30` | Connect, read, write, and connection-pool timeout for proxied `/messages/` requests. |
-| `CONNECTOR_SSE_IDLE_TIMEOUT_SECONDS` | No | `300` | Idle timeout for `/sse` streams: a stream that yields no upstream bytes within this window is closed. |
-| `CONNECTOR_MAX_STREAMS_PER_PRINCIPAL` | No | `4` | Maximum concurrent `/sse` streams per principal (enforced per connector process). Additional streams are rejected with `429` and a `Retry-After` hint. |
+| `CONNECTOR_SSE_IDLE_TIMEOUT_SECONDS` | No | `300` | Timeout for `/sse` streams: a stream that yields no upstream bytes within this window is closed, and the initial upstream connection/handshake is also bounded by this window (a connection that does not complete in time fails with `502`). |
+| `CONNECTOR_MAX_STREAMS_PER_PRINCIPAL` | No | `4` | Maximum concurrent `/sse` streams per principal (enforced per connector process). Additional streams are rejected with `429` and a short advisory `Retry-After` hint (slots free as streams end). |
 | `CONNECTOR_REFRESH_TOKEN_TTL_SECONDS` | No | `2592000` | Refresh-token lifetime. |
 | `CONNECTOR_TOKEN_STORE_PATH` | No | `$XDG_STATE_HOME/mnemos-bridge-claude-connector/oauth.sqlite3`, or `~/.local/state/mnemos-bridge-claude-connector/oauth.sqlite3` | SQLite TTL store for authorization codes, access-token mappings, and refresh tokens. Use a persistent local volume. All connector workers on a host must use the same path. |
 

@@ -121,6 +121,38 @@ async def test_sse_fifth_concurrent_stream_returns_429(
 
 
 @pytest.mark.asyncio
+async def test_sse_stream_limit_rejects_fifth_with_advisory_retry_after(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the per-principal cap is hit, the 429 must carry a short, fixed
+    advisory Retry-After -- not the (much longer) idle-timeout window, since a
+    slot frees as soon as its stream ends.
+    """
+    monkeypatch.setenv("CONNECTOR_MAX_STREAMS_PER_PRINCIPAL", "4")
+    monkeypatch.setenv("CONNECTOR_SSE_IDLE_TIMEOUT_SECONDS", "300")
+    _sse_harness(monkeypatch, [b"data: hi\n\n"])
+
+    held: list[tuple] = []
+    for _ in range(4):
+        body, status = await proxy.sse_proxy(_AuthRequest(), "http://mnemos.test", "jwt")
+        assert status == 200
+        held.append((body, status))
+
+    response = await proxy.sse_proxy(_AuthRequest(), "http://mnemos.test", "jwt")
+    assert response.status_code == 429
+    retry_after = response.headers.get("retry-after") or response.headers.get("Retry-After")
+    assert retry_after is not None
+    assert int(retry_after) == proxy._RETRY_AFTER_SECONDS
+    # The advisory must not advertise the idle-timeout window.
+    assert int(retry_after) < int(proxy._sse_idle_timeout_seconds())
+
+    # Clean up: release every stream so the autouse fixture starts fresh.
+    for body_iter, _ in held:
+        async for _ in body_iter:
+            pass
+
+
+@pytest.mark.asyncio
 async def test_sse_idle_upstream_closed_after_timeout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -278,12 +310,15 @@ async def test_sse_handshake_timeout_maps_to_502_and_releases_slot(
 
 
 @pytest.mark.asyncio
-async def test_teardown_cancellation_safety_releases_all_resources() -> None:
-    """If teardown() runs inside an already-cancelled task (the client-disconnect
-    scenario), every resource -- the stream, the client, and the slot -- is still
-    released because the body retries on CancelledError.
+async def test_teardown_cancellation_safety_releases_all_resources(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If the consuming task is cancelled while the body generator is live
+    (the client-disconnect scenario), the generator's ``finally: await
+    teardown()`` runs inside that already-cancelled task. The shielded cleanup
+    coroutine must still release every resource -- the stream, the client, and
+    the slot -- without hanging or busy-spinning.
     """
-    proxy._active_sse_streams.clear()
     principal = "principal-cancel"
 
     events: list[str] = []
@@ -318,32 +353,108 @@ async def test_teardown_cancellation_safety_releases_all_resources() -> None:
 
         HTTPError = RuntimeError
 
-    monkeypatch = pytest.MonkeyPatch()
     monkeypatch.setattr(proxy, "verify_access_token", lambda *_args: principal)
     monkeypatch.setattr(proxy, "_httpx_module", lambda: _Httpx)
     monkeypatch.setattr(
         proxy, "_streaming_response", lambda body, status_code: (body, status_code)
     )
-    try:
-        body, status = await proxy.sse_proxy(_AuthRequest(), "http://mnemos.test", "jwt")
-        assert status == 200
-        assert proxy._active_sse_streams.get(principal) == 1
 
-        # Consume the first chunk (starts the generator and acquires the slot),
-        # then cancel the iteration task so the generator's finally block runs
-        # inside a cancelled task -- exactly the client-disconnect scenario.
-        agen = body.__aiter__()
-        first = asyncio.ensure_future(agen.__anext__())
-        await asyncio.sleep(0)
-        assert (await first) == b"data: ok\n\n"
+    body, status = await proxy.sse_proxy(_AuthRequest(), "http://mnemos.test", "jwt")
+    assert status == 200
+    assert proxy._active_sse_streams.get(principal) == 1
 
-        second = asyncio.ensure_future(agen.__anext__())
-        await asyncio.sleep(0)
-        second.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await second
-    finally:
-        monkeypatch.undo()
+    # Drive the generator from a dedicated task and cancel THAT task while the
+    # generator is suspended in its read loop. The task's cancellation runs the
+    # generator's ``finally`` block inside the cancelled task -- cancelling an
+    # outer wrapper task would only leave the generator running elsewhere and
+    # would not exercise this path.
+    async def _consume() -> None:
+        async for _chunk in body:
+            pass
+
+    consumer = asyncio.ensure_future(_consume())
+    await asyncio.sleep(0.05)  # let it yield the first chunk and hang on the next
+    assert consumer.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await consumer
+
+    # Give the shielded cleanup coroutine a beat to finish on the loop.
+    await asyncio.sleep(0.05)
+
+    assert "stream_exit" in events
+    assert "client_closed" in events
+    assert proxy._active_sse_streams.get(principal) in (None, 0)
+
+
+@pytest.mark.asyncio
+async def test_teardown_direct_call_in_cancelled_task(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression guard: if teardown() is entered while its calling task is
+    already cancelled, cleanup must still complete. The cleanup runs in a
+    shielded coroutine (not a retry loop), so an already-cancelled task must
+    not cause the release to hang or spin.
+    """
+    principal = "principal-cancel-direct"
+
+    events: list[str] = []
+
+    class _Upstream:
+        status_code = 200
+
+        async def aiter_bytes(self):
+            yield b"data: ok\n\n"
+            await asyncio.sleep(10)
+
+    class _StreamContext:
+        async def __aenter__(self):
+            return _Upstream()
+
+        async def __aexit__(self, *_args: object):
+            events.append("stream_exit")
+
+    class _Client:
+        def stream(self, *_args: object, **kwargs: object):
+            return _StreamContext()
+
+        async def aclose(self):
+            events.append("client_closed")
+
+    class _Httpx:
+        @staticmethod
+        def AsyncClient(**kwargs):
+            return _Client()
+
+        HTTPError = RuntimeError
+
+    monkeypatch.setattr(proxy, "verify_access_token", lambda *_args: principal)
+    monkeypatch.setattr(proxy, "_httpx_module", lambda: _Httpx)
+    monkeypatch.setattr(
+        proxy, "_streaming_response", lambda body, status_code: (body, status_code)
+    )
+
+    body, status = await proxy.sse_proxy(_AuthRequest(), "http://mnemos.test", "jwt")
+    assert status == 200
+    assert proxy._active_sse_streams.get(principal) == 1
+
+    # Start consuming so the generator is live and suspended, then cancel the
+    # consumer task. The generator's finally calls teardown() inside the
+    # cancelled task; if the old retry-loop form were in place this path would
+    # risk an unbounded spin. The watchdog below fails the test if cleanup
+    # never finishes.
+    async def _consume() -> None:
+        async for _chunk in body:
+            pass
+
+    consumer = asyncio.ensure_future(_consume())
+    await asyncio.sleep(0.05)
+    assert consumer.cancel()
+    # The watchdog fails the test if cleanup ever hung or spun without
+    # finishing -- exactly the failure mode of a retry loop inside a cancelled
+    # task.
+    with contextlib.suppress(asyncio.CancelledError, TimeoutError):
+        await asyncio.wait_for(consumer, timeout=2.0)
+    await asyncio.sleep(0.05)
 
     assert "stream_exit" in events
     assert "client_closed" in events
