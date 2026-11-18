@@ -503,6 +503,7 @@ async def oauth_authorize_post(request: Request) -> Response:
             params["code_challenge"],
             params["code_challenge_method"],
             params["redirect_uri"],
+            secret=CONNECTOR_JWT_SECRET,
         )
     except AuthorizationCodeLimitExceeded:
         return _render_authorize_form(
@@ -536,7 +537,10 @@ async def oauth_token(request: Request) -> Response:
             )
 
         try:
-            api_key = consume_code(code, code_verifier, redirect_uri, client_id)
+            api_key = consume_code(
+                code, code_verifier, redirect_uri, client_id,
+                secret=CONNECTOR_JWT_SECRET,
+            )
         except ApiKeyDecryptionError:
             logger.warning("stored MNEMOS API key failed to decrypt; denying token exchange")
             return _oauth_error(
@@ -568,7 +572,7 @@ async def oauth_token(request: Request) -> Response:
         if not refresh_token:
             return _oauth_error("invalid_request", "Missing refresh_token.")
 
-        api_key = peek_refresh_token(refresh_token)
+        api_key = peek_refresh_token(refresh_token, secret=CONNECTOR_JWT_SECRET)
         if api_key is None:
             return _oauth_error("invalid_grant", "Invalid refresh_token.")
         try:

@@ -639,6 +639,7 @@ async def test_authorize_uses_provisioned_per_user_mcp_token(
             "correct-verifier",
             authorize_params["redirect_uri"],
             authorize_params["client_id"],
+            secret=server_module.CONNECTOR_JWT_SECRET,
         )
         == "valid-test-key"
     )
@@ -682,6 +683,7 @@ async def test_shared_token_accepts_only_configured_single_user_key(
             "correct-verifier",
             authorize_params["redirect_uri"],
             authorize_params["client_id"],
+            secret=server_module.CONNECTOR_JWT_SECRET,
         )
         == "valid-test-key"
     )
@@ -703,6 +705,7 @@ async def test_authorize_supports_upstream_two_field_token_mapping(
             "correct-verifier",
             authorize_params["redirect_uri"],
             authorize_params["client_id"],
+            secret=server_module.CONNECTOR_JWT_SECRET,
         )
         == "valid-test-key"
     )
@@ -727,6 +730,7 @@ async def test_per_user_mapping_takes_precedence_over_shared_token(
             "correct-verifier",
             authorize_params["redirect_uri"],
             authorize_params["client_id"],
+            secret=server_module.CONNECTOR_JWT_SECRET,
         )
         == "valid-test-key"
     )

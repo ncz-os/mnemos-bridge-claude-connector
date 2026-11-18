@@ -46,6 +46,10 @@ def _insert_legacy_plaintext(kind: str, token: str) -> None:
 
 
 def _store_bytes() -> bytes:
+    # The store runs in WAL mode, so freshly written content may still sit in
+    # the -wal sidecar; checkpoint first so the main file reflects everything.
+    with sqlite3.connect(oauth._store_path()) as connection:
+        connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
     with open(oauth._store_path(), "rb") as handle:
         return handle.read()
 
@@ -105,12 +109,15 @@ def test_wrong_secret_fails_closed_with_clear_error() -> None:
     try:
         with pytest.raises(oauth.ApiKeyDecryptionError, match="CONNECTOR_JWT_SECRET"):
             oauth._decrypt_api_key(_raw_api_key_values()[0])
-        # OAuth entry points deny the request instead of leaking or crashing.
-        assert oauth.verify_access_token(access_token, JWT_SECRET_A) is None
-        assert oauth.peek_refresh_token(refresh_token) is None
-        assert oauth.exchange_refresh_token(refresh_token, JWT_SECRET_A) is None
+        # OAuth entry points deny the request instead of leaking or crashing
+        # when the configured data-encryption secret cannot open the row.
+        assert oauth.verify_access_token(access_token, JWT_SECRET_B) is None
+        assert oauth.peek_refresh_token(refresh_token, JWT_SECRET_B) is None
+        assert oauth.exchange_refresh_token(refresh_token, JWT_SECRET_B) is None
     finally:
         os.environ["CONNECTOR_JWT_SECRET"] = JWT_SECRET_A
+    # The failed exchange above consumed (deleted) the poisoned row.
+    assert not oauth._entry_exists_for_test("refresh", refresh_token)
 
 
 def test_ciphertext_uses_random_nonce() -> None:
@@ -145,7 +152,7 @@ def test_poisoned_refresh_row_is_deleted_and_denied() -> None:
     _access, refresh_token = oauth.issue_access_token(API_KEY, JWT_SECRET_A)
     os.environ["CONNECTOR_JWT_SECRET"] = JWT_SECRET_B
     try:
-        assert oauth.exchange_refresh_token(refresh_token, JWT_SECRET_A) is None
+        assert oauth.exchange_refresh_token(refresh_token, JWT_SECRET_B) is None
     finally:
         os.environ["CONNECTOR_JWT_SECRET"] = JWT_SECRET_A
     assert not oauth._entry_exists_for_test("refresh", refresh_token)
@@ -179,5 +186,161 @@ def test_undecryptable_rows_count_conservatively_toward_rate_limit() -> None:
                 oauth.generate_code(
                     "another-key", "client-id", challenge, "S256", "https://x.test/cb"
                 )
+    finally:
+        os.environ["CONNECTOR_JWT_SECRET"] = JWT_SECRET_A
+
+
+def test_save_entry_uses_caller_provided_secret_not_environment() -> None:
+    """Regression: _save_entry must propagate `secret` to _encrypt_api_key.
+
+    Without propagation the issued rows are keyed to the ambient
+    CONNECTOR_JWT_SECRET, breaking callers that pass an explicit key.
+    """
+    real_secret_value = os.environ.get("CONNECTOR_JWT_SECRET")
+    os.environ.pop("CONNECTOR_JWT_SECRET", None)
+    try:
+        access_token, refresh_token = oauth.issue_access_token(API_KEY, JWT_SECRET_A)
+    finally:
+        if real_secret_value is not None:
+            os.environ["CONNECTOR_JWT_SECRET"] = real_secret_value
+    # Rows encrypted with the explicit secret decrypt with it and survive a
+    # JWT round-trip verified against the same secret.
+    assert oauth.verify_access_token(access_token, JWT_SECRET_A) == API_KEY
+    assert oauth.peek_refresh_token(refresh_token, JWT_SECRET_A) == API_KEY
+    assert API_KEY.encode() not in _store_bytes()
+
+
+def test_generate_code_uses_caller_provided_secret_for_rate_limit() -> None:
+    """generate_code must encrypt and count with the caller-provided secret."""
+    challenge = oauth._base64url_sha256("verifier-secret-propagation")
+    real_secret_value = os.environ.get("CONNECTOR_JWT_SECRET")
+    os.environ.pop("CONNECTOR_JWT_SECRET", None)
+    try:
+        code = oauth.generate_code(
+            API_KEY, "client-id", challenge, "S256", "https://x.test/cb",
+            secret=JWT_SECRET_A,
+        )
+        assert oauth.consume_code(
+            code, "verifier-secret-propagation", "https://x.test/cb", "client-id",
+            secret=JWT_SECRET_A,
+        ) == API_KEY
+    finally:
+        if real_secret_value is not None:
+            os.environ["CONNECTOR_JWT_SECRET"] = real_secret_value
+
+
+def test_migration_encrypts_legacy_plaintext_exactly_once() -> None:
+    """A legacy row must read back as the original key after migration.
+
+    The legacy branch of _decode_and_migrate_api_key receives the raw
+    plaintext in `stored`; encrypting the already-prefixed ciphertext a
+    second time would make the row undecryptable (double encryption).
+    """
+    legacy_refresh = "legacy-once-" + secrets.token_urlsafe(8)
+    _insert_legacy_plaintext("refresh", legacy_refresh)
+
+    first = oauth.peek_refresh_token(legacy_refresh, JWT_SECRET_A)
+    assert first == API_KEY
+
+    migrated = oauth._raw_api_key_value_for_test("refresh", legacy_refresh)
+    assert migrated.startswith("v1:")
+    assert API_KEY not in migrated
+
+    # Second read takes the decrypt path and returns the same plaintext.
+    second = oauth.peek_refresh_token(legacy_refresh, JWT_SECRET_A)
+    assert second == API_KEY
+
+
+def test_consume_code_requires_the_storage_secret() -> None:
+    """consume_code decrypts with the secret generate_code stored with.
+
+    A wrong explicit secret fails closed (ApiKeyDecryptionError); the right
+    one returns the principal. The PKCE verifier is never an encryption key.
+    """
+    import mnemos_bridge_claude_connector.oauth as oauth_module
+
+    challenge = oauth_module._base64url_sha256("storage-secret-verifier")
+    code = oauth.generate_code(
+        API_KEY, "client-id", challenge, "S256", "https://x.test/cb",
+        secret=JWT_SECRET_A,
+    )
+    with pytest.raises(oauth.ApiKeyDecryptionError, match="CONNECTOR_JWT_SECRET"):
+        oauth.consume_code(
+            code, "storage-secret-verifier", "https://x.test/cb", "client-id",
+            secret=JWT_SECRET_B,
+        )
+
+
+def test_consume_code_without_secret_uses_environment() -> None:
+    """consume_code(secret=None) falls back to CONNECTOR_JWT_SECRET (fail-closed)."""
+    import mnemos_bridge_claude_connector.oauth as oauth_module
+
+    challenge = oauth_module._base64url_sha256("env-fallback-verifier")
+    code = oauth.generate_code(
+        API_KEY, "client-id", challenge, "S256", "https://x.test/cb",
+        secret=JWT_SECRET_A,
+    )
+    assert (
+        oauth.consume_code(
+            code, "env-fallback-verifier", "https://x.test/cb", "client-id",
+        )
+        == API_KEY
+    )
+
+
+def test_consume_code_rejects_non_string_secret_with_type_error() -> None:
+    """A non-str secret is a programming error: TypeError, not a decrypt error."""
+    challenge = oauth._base64url_sha256("type-check-verifier")
+    code = oauth.generate_code(
+        API_KEY, "client-id", challenge, "S256", "https://x.test/cb",
+        secret=JWT_SECRET_A,
+    )
+    with pytest.raises(TypeError, match="secret must be a str or None"):
+        oauth.consume_code(
+            code, "type-check-verifier", "https://x.test/cb", "client-id",
+            secret=12345,  # type: ignore[arg-type]
+        )
+
+
+def test_rate_limit_quota_recovers_after_secret_rotation_rows_expire() -> None:
+    """A rotation can never permanently exhaust a principal's quota.
+
+    Rows written under the old key fail closed and count toward the cap, but
+    authorization codes and issuance markers live at most 60 seconds, so once
+    they expire the principal can issue again under the new key.
+    """
+    challenge = oauth._base64url_sha256("quota-recovery-verifier")
+    oauth.generate_code(
+        API_KEY, "client-id", challenge, "S256", "https://x.test/cb",
+        secret=JWT_SECRET_A,
+    )
+    os.environ["CONNECTOR_JWT_SECRET"] = JWT_SECRET_B
+    try:
+        # Old-key row is undecryptable under the new key: still fail closed.
+        with pytest.raises(oauth.AuthorizationCodeLimitExceeded):
+            for _ in range(oauth._MAX_OUTSTANDING_CODES_PER_PRINCIPAL_CLIENT):
+                oauth.generate_code(
+                    "another-key", "client-id", challenge, "S256", "https://x.test/cb",
+                    secret=JWT_SECRET_B,
+                )
+        # Let every code/issuance row expire, then issuance works again.
+        expired = __import__("time").time() - 1
+        with oauth._connect() as connection:
+            connection.execute(
+                "UPDATE connector_oauth_entries SET expires_at = ? "
+                "WHERE kind IN ('code', 'code_issue')",
+                (expired,),
+            )
+        code = oauth.generate_code(
+            "another-key", "client-id", challenge, "S256", "https://x.test/cb",
+            secret=JWT_SECRET_B,
+        )
+        assert (
+            oauth.consume_code(
+                code, "quota-recovery-verifier", "https://x.test/cb", "client-id",
+                secret=JWT_SECRET_B,
+            )
+            == "another-key"
+        )
     finally:
         os.environ["CONNECTOR_JWT_SECRET"] = JWT_SECRET_A
