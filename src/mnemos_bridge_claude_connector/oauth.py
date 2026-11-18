@@ -126,7 +126,10 @@ def _connect() -> Iterator[sqlite3.Connection]:
     connection without its schema present.
     """
     path = _store_path()
-    key = str(path)
+    # Resolve the path once so '..' segments, trailing slashes and symlink
+    # differences collapse to one canonical key; otherwise the same file pays
+    # for redundant DDL passes and accumulates duplicate set entries.
+    key = str(path.resolve())
     with _lock:
         path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         if key not in _initialized_paths:
