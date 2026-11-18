@@ -265,25 +265,44 @@ async def sse_proxy(
         HTTP client, and the per-principal SSE slot.
 
         Every failure path funnels through this one place so cleanup is always
-        applied together -- never partially -- and shielded so an in-flight
-        cancellation cannot leave the stream or slot half-released.
+        applied together -- never partially.
+
+        ``asyncio.shield`` protects the *inner* coroutine from cancellation, but
+        the ``await`` expression itself still raises ``CancelledError`` the
+        instant the calling task is cancelled (e.g. a client disconnect that
+        cancels the body iterator, whose ``finally: await teardown()`` then runs
+        inside an already-cancelled task). Because ``CancelledError`` is a
+        ``BaseException``, a bare ``contextlib.suppress(Exception)`` would not
+        catch it, and the remaining awaits -- including ``_release_sse_slot`` --
+        would never run, permanently leaking the per-principal slot and locking
+        the principal out of ``/sse``. The body therefore runs inside a loop
+        that swallows ``CancelledError`` and retries so every step completes.
         """
-        if stream_owned:
-            with contextlib.suppress(Exception):
-                await asyncio.shield(stream_context.__aexit__(None, None, None))
-        with contextlib.suppress(Exception):
-            await asyncio.shield(client.aclose())
-        await asyncio.shield(_release_sse_slot(principal))
+        while True:
+            try:
+                if stream_owned:
+                    with contextlib.suppress(Exception):
+                        await asyncio.shield(stream_context.__aexit__(None, None, None))
+                with contextlib.suppress(Exception):
+                    await asyncio.shield(client.aclose())
+                await asyncio.shield(_release_sse_slot(principal))
+                break
+            except asyncio.CancelledError:
+                # The task running teardown was cancelled: retry so all three
+                # shielded steps finish before we exit.
+                continue
 
     try:
         async with asyncio.timeout(_sse_idle_timeout_seconds()):
             upstream = await stream_context.__aenter__()
         stream_owned = True
-    except httpx.HTTPError as exc:
-        detail = redact_url_credentials(str(exc))
+    except (httpx.HTTPError, TimeoutError) as exc:
+        # A TimeoutError from the bounded handshake (upstream unreachable during
+        # connect) is the same gateway failure mode as an httpx.HTTPError and is
+        # translated to the same 502 response rather than surfacing as a 500.
         await teardown()
         return _json_response(
-            {"error": "bad_gateway", "detail": detail},
+            {"error": "bad_gateway", "detail": redact_url_credentials(str(exc))},
             status_code=502,
         )
     except BaseException:
