@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import math
 import os
+import threading
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import TYPE_CHECKING, Any
 
@@ -61,7 +62,7 @@ _HOP_BY_HOP_HEADERS = {
 _FORWARDED_HEADER_PREFIX = "x-forwarded-"
 
 _active_sse_streams: dict[str, int] = {}
-_sse_streams_lock = asyncio.Lock()
+_sse_streams_lock = threading.Lock()
 
 
 class _PayloadTooLarge(Exception):
@@ -114,7 +115,7 @@ def _max_streams_per_principal() -> int:
 
 async def _try_acquire_sse_slot(principal: str) -> bool:
     limit = _max_streams_per_principal()
-    async with _sse_streams_lock:
+    with _sse_streams_lock:
         active = _active_sse_streams.get(principal, 0)
         if active >= limit:
             return False
@@ -123,9 +124,13 @@ async def _try_acquire_sse_slot(principal: str) -> bool:
 
 
 async def _release_sse_slot(principal: str) -> None:
-    async with _sse_streams_lock:
+    with _sse_streams_lock:
         active = _active_sse_streams.get(principal, 0)
-        if active <= 1:
+        if active <= 0:
+            # Defensive: the principal was never tracked or already fully
+            # released; drop any stale entry and do not go negative.
+            _active_sse_streams.pop(principal, None)
+        elif active <= 1:
             _active_sse_streams.pop(principal, None)
         else:
             _active_sse_streams[principal] = active - 1
@@ -224,13 +229,19 @@ async def sse_proxy(
         return _unauthorized_response()
 
     if not await _try_acquire_sse_slot(principal):
+        # Advise retry after the idle-timeout window, not a hard-coded 60s.
+        retry_after = max(1, int(math.ceil(_sse_idle_timeout_seconds())))
         return _json_response(
             {"error": "too_many_streams"},
             status_code=429,
-            headers={"Retry-After": "60"},
+            headers={"Retry-After": str(retry_after)},
         )
 
     httpx = _httpx_module()
+    # The SSE body is unbounded (read=None), so we do not set an overall client
+    # timeout. Instead, the connection/handshake is bounded below with an
+    # asyncio timeout, and each body read is guarded by the idle timeout inside
+    # the generator.
     try:
         client = httpx.AsyncClient(timeout=None)
     except Exception:
@@ -242,8 +253,16 @@ async def sse_proxy(
         headers=_headers_with_swapped_authorization(request, api_key),
     )
 
+    # Track whether we actually own the stream context and client so the
+    # cleanup path (and the body generator) never double-closes them.
+    stream_owned = False
+    client_owned = False
+
     try:
-        upstream = await stream_context.__aenter__()
+        async with asyncio.timeout(_sse_idle_timeout_seconds()):
+            upstream = await stream_context.__aenter__()
+        stream_owned = True
+        client_owned = True
     except httpx.HTTPError as exc:
         detail = redact_url_credentials(str(exc))
         with contextlib.suppress(Exception):
@@ -275,22 +294,29 @@ async def sse_proxy(
         except httpx.HTTPError as exc:
             raise RuntimeError(redact_url_credentials(str(exc))) from None
         finally:
-            with contextlib.suppress(Exception):
-                await asyncio.shield(stream_context.__aexit__(None, None, None))
-            with contextlib.suppress(Exception):
-                await asyncio.shield(client.aclose())
+            # Cancellation-safe teardown: shield the cleanup so an in-flight
+            # cancellation does not leave the stream or slot half-released.
+            if stream_owned:
+                with contextlib.suppress(Exception):
+                    await asyncio.shield(stream_context.__aexit__(None, None, None))
+            if client_owned:
+                with contextlib.suppress(Exception):
+                    await asyncio.shield(client.aclose())
             await asyncio.shield(_release_sse_slot(principal))
 
     try:
         return _streaming_response(body_iterator(), status_code=upstream.status_code)
     except BaseException:
         # StreamingResponse construction failed: the generator's finally will
-        # never run, so release the slot here to avoid a permanent leak.
+        # never run, so release the slot and close resources here to avoid a
+        # permanent leak.
         await asyncio.shield(_release_sse_slot(principal))
-        with contextlib.suppress(Exception):
-            await asyncio.shield(stream_context.__aexit__(None, None, None))
-        with contextlib.suppress(Exception):
-            await asyncio.shield(client.aclose())
+        if stream_owned:
+            with contextlib.suppress(Exception):
+                await asyncio.shield(stream_context.__aexit__(None, None, None))
+        if client_owned:
+            with contextlib.suppress(Exception):
+                await asyncio.shield(client.aclose())
         raise
 
 
